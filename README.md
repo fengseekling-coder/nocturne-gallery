@@ -1,50 +1,90 @@
 # Nocturne Gallery
 
-Nocturne Gallery is a local-first desktop asset manager for designers and creative workers. It helps organize visual references, prompts, source attachments, web captures, and duplicate media without sending the user's library to a cloud service.
+Open-source, local-first desktop workspace for visual references, prompts, and source attachments.
 
-The app is built with Tauri 2, React 18, TypeScript, Tailwind CSS, Rust, and SQLite. The interface is Chinese-first and follows a dark Arc-inspired minimalist visual system.
+Nocturne Gallery is for designers, AI creators, creative workers, and indie makers who collect visual inspiration while moving between folders, browsers, AI tools, and design software. It brings reference images, prompts, grouping, duplicate checks, and external source-file attachments into one private desktop library.
 
-## Why This Project Exists
+一个开源、本地优先的桌面工作台，把参考图、Prompt 和源文件附件整理在同一个创意素材库里。
 
-Creative asset libraries become hard to maintain when files, prompts, references, source project files, and web inspiration are scattered across folders and tools. Nocturne Gallery provides a local workspace where those materials can be imported, grouped, searched, previewed, annotated, and exported while preserving the original files.
+[Build from source](#build-from-source) · [Roadmap](./ROADMAP.md) · [Contributing](./CONTRIBUTING.md)
 
-The project focuses on practical maintainer work:
+## Preview
 
-- Cross-platform desktop behavior across macOS and Windows.
-- Local SQLite data modeling and migration-safe storage.
-- Media scanning, thumbnail generation, deduplication, and drag-and-drop workflows.
-- Performance work for masonry grids, large image libraries, and preview synchronization.
-- AI-assisted prompt and metadata workflows that remain controlled by local settings.
+Screenshots and workflow GIFs are being prepared for the first public alpha.
+
+Planned preview assets:
+
+- `docs/assets/screenshot-gallery.png` — main gallery and grouped asset view.
+- `docs/assets/screenshot-inspector.png` — inspector with prompt and attachment context.
+- `docs/assets/demo-import.gif` — import workflow from local files, folders, or the web.
+
+See [docs/assets/README.md](./docs/assets/README.md) for the visual asset checklist.
+
+## What It Helps With
+
+Creative reference work often spreads across too many places:
+
+- Reference images live in nested folders, downloads, screenshots, browser tabs, and chat threads.
+- Prompts and generation notes sit in AI tools, documents, or copied text snippets.
+- Source files, project files, and related references are easy to lose after the final image is saved.
+- The same asset is imported again because it was renamed, moved, or saved from another source.
+
+Nocturne Gallery tries to collect that creative context into a local private library, so visual references, prompts, grouping, duplicate detection, preview context, and source attachments stay close to the work they describe.
+
+## Core Workflows
+
+### Capture
+
+Bring material into the library from local files, local folders, and web-dragged assets. Folder import is designed for recursive local imports, and import progress is surfaced in the app instead of failing silently.
+
+### Organize
+
+Use main groups and custom subgroups to separate collections. Search local metadata, keep editable prompt text with the selected asset, attach external source/reference files, and rely on SHA-256 plus perceptual hash checks to catch duplicates.
+
+### Reuse
+
+Preview assets, keep the inspector synchronized with the current selection, and drag one or more selected assets back out to external creative tools when you need to continue working elsewhere.
 
 ## Features
 
-- Local media library with SQLite persistence.
-- Masonry gallery with multi-stage image thumbnail loading.
-- Video first-frame thumbnails.
+- Local media library backed by SQLite.
+- Masonry-style gallery with multi-stage image thumbnail loading.
+- Video first-frame thumbnail support.
 - SHA-256 and perceptual hash based duplicate detection.
 - Main group and sub-group isolation rules.
 - Full-screen preview synchronized with the inspector panel.
-- Editable prompt field with attachment references.
-- External attachment cards for source files, project files, and references.
+- Editable prompt field.
+- External attachment references for source files, project files, and related materials.
 - Local file, folder, and web asset drag-in.
 - Single and multi-file drag-out.
 - Tauri/Rust commands for scanning, import, thumbnail work, preferences, and AI tool integration.
 
+## Privacy Model
+
+Nocturne Gallery is local-first by design:
+
+- Media files stay on your device.
+- SQLite data is stored locally.
+- No cloud account is required.
+- AI provider integration is optional.
+- External AI requests only happen when explicitly configured.
+- The app should not rename or mutate original user files.
+
+Read the fuller privacy notes in [docs/PRIVACY.md](./docs/PRIVACY.md).
+
+## How It Is Different
+
+Nocturne Gallery is not a normal photo album, a cloud asset library, a bookmark manager, a note-first vault, or a simple reference board.
+
+It is closer to a private creative workspace than a photo album: local-first, open-source, desktop-native, and centered on the relationship between visual references, prompts, source attachments, duplicate detection, and drag-in / drag-out workflows.
+
 ## Current Status
 
-This repository is an early public release of an active desktop application. The core app structure, media workflows, inspector, preview synchronization, attachment panel, and performance tooling are present. Packaging, documentation, automated tests, and cross-platform polish are still being improved.
+This repository is an early public release of an active desktop application. The core app structure, media workflows, inspector, preview synchronization, attachment panel, import/export drag behavior, and performance tooling are present.
 
-## Tech Stack
+Packaging, release artifacts, automated regression tests, public screenshots, and cross-platform polish are still being improved. There is currently no packaged GitHub Release in this repository, so the project should be built from source.
 
-- Tauri 2
-- React 18
-- TypeScript
-- Tailwind CSS
-- Rust
-- SQLite via `rusqlite`
-- Vite
-
-## Getting Started
+## Build from Source
 
 ### Prerequisites
 
@@ -82,29 +122,39 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 On macOS, if Vite/Rollup fails to load `@rollup/rollup-darwin-arm64` because of a local code-signing mismatch, reinstall Node dependencies or run with a Node binary that can load ad-hoc signed native add-ons. This is an environment issue, not an application source issue.
 
+## Tech Stack
+
+- Tauri 2
+- React 18
+- TypeScript
+- Tailwind CSS
+- Rust
+- SQLite via `rusqlite`
+- Vite
+
 ## Repository Layout
 
 ```text
 src/                 React application, stores, components, UI tokens
 src-tauri/           Tauri 2 Rust backend, SQLite, media commands
-docs/                Design, installation, thumbnail, and performance notes
+docs/                Design, installation, thumbnail, privacy, and performance notes
 scripts/             Local verification and audit helpers
 tools/               Supporting maintainer tools
 ```
 
-## Maintainer Focus
+## Roadmap
 
-Near-term maintenance work is tracked in [ROADMAP.md](./ROADMAP.md). The most important areas are:
+Near-term maintenance work is tracked in [ROADMAP.md](./ROADMAP.md). Current priorities include:
 
+- Public repository readiness.
 - Build and packaging reliability on macOS and Windows.
-- Import progress and duplicate confirmation behavior.
-- Media thumbnail correctness and performance.
-- Inspector and full-screen preview synchronization.
-- Safer AI provider configuration and local-first defaults.
+- Import and duplicate confirmation reliability.
+- Thumbnail diagnostics and media performance.
+- Focused checks for group isolation and preview synchronization.
 
 ## Contributing
 
-Contributions are welcome. Please read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening issues or pull requests.
+Contributions are welcome, especially around documentation, packaging reliability, local-first behavior, performance, and cross-platform validation. Please read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening issues or pull requests.
 
 ## Security
 
