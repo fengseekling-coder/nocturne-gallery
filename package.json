@@ -2,7 +2,12 @@
   "name": "nocturne-gallery",
   "version": "0.1.0",
   "description": "本地桌面端素材管理软件 — 为设计师和创意工作者打造",
-  "private": true,
+  "private": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fengseekling-coder/nocturne-gallery.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
