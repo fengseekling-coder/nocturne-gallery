@@ -10,13 +10,14 @@ Nocturne Gallery is for designers, AI creators, creative workers, and indie make
 
 ## Preview
 
-Screenshots and workflow GIFs are being prepared for the first public alpha.
+Screenshots and workflow GIFs are being prepared for the first public alpha. Until the real captures are available, this README intentionally uses text-only placeholders to avoid broken image previews.
 
-Planned preview assets:
+First public screenshot pack:
 
 - `docs/assets/screenshot-gallery.png` — main gallery and grouped asset view.
 - `docs/assets/screenshot-inspector.png` — inspector with prompt and attachment context.
-- `docs/assets/demo-import.gif` — import workflow from local files, folders, or the web.
+- `docs/assets/screenshot-preview.png` — full-screen preview with synchronized inspector context.
+- `docs/assets/demo-import.gif` — import, organize, prompt, attach, and reuse workflow.
 
 See [docs/assets/README.md](./docs/assets/README.md) for the visual asset checklist.
 
@@ -44,6 +45,22 @@ Use main groups and custom subgroups to separate collections. Search local metad
 ### Reuse
 
 Preview assets, keep the inspector synchronized with the current selection, and drag one or more selected assets back out to external creative tools when you need to continue working elsewhere.
+
+## Workflow
+
+The first public workflow GIF will show a short path from scattered files to reusable context:
+
+```text
+drag in local files or a folder
+-> import progress appears
+-> assets enter the gallery
+-> select an image
+-> edit prompt context
+-> attach a source/reference file
+-> drag the asset back out to another creative tool
+```
+
+Planned path: `docs/assets/demo-import.gif`
 
 ## Features
 
@@ -77,6 +94,13 @@ Read the fuller privacy notes in [docs/PRIVACY.md](./docs/PRIVACY.md).
 Nocturne Gallery is not a normal photo album, a cloud asset library, a bookmark manager, a note-first vault, or a simple reference board.
 
 It is closer to a private creative workspace than a photo album: local-first, open-source, desktop-native, and centered on the relationship between visual references, prompts, source attachments, duplicate detection, and drag-in / drag-out workflows.
+
+## More Screenshots
+
+Optional screenshots are planned after the first public screenshot pack:
+
+- `docs/assets/screenshot-duplicates.png` — duplicate import confirmation and existing asset context.
+- `docs/assets/screenshot-groups.png` — main groups, subgroups, and grouped library organization.
 
 ## Current Status
 
