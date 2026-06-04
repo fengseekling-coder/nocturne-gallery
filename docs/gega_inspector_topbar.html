@@ -1,0 +1,267 @@
+
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  .wrap {
+    display: flex;
+    width: 100%;
+    height: 600px;
+    background: #0D0D0D;
+    border-radius: 12px;
+    overflow: hidden;
+    font-family: 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+
+  /* SIDEBAR */
+  .sidebar {
+    width: 192px; min-width: 192px;
+    background: #111111;
+    border-right: 1px solid rgba(255,255,255,0.05);
+    display: flex; flex-direction: column;
+  }
+  .sidebar-logo {
+    height: 48px; display: flex; align-items: center; gap: 8px;
+    padding: 0 16px; border-bottom: 1px solid rgba(255,255,255,0.05); flex-shrink: 0;
+  }
+  .logo-text { font-size: 15px; font-weight: 600; color: #90FF21; letter-spacing: 0.5px; }
+  .sidebar-section { padding: 8px; flex: 1; }
+  .nav-item { display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: 8px; margin-bottom: 2px; cursor: pointer; }
+  .nav-item.active { background: rgba(144,255,33,0.1); }
+  .nav-item svg { width: 16px; height: 16px; flex-shrink: 0; opacity: 0.35; }
+  .nav-item.active svg { opacity: 1; }
+  .nav-label { font-size: 13px; color: rgba(255,255,255,0.25); }
+  .nav-item.active .nav-label { color: #90FF21; font-weight: 500; }
+  .nav-divider { height: 1px; background: rgba(255,255,255,0.05); margin: 8px; }
+  .sidebar-bottom { padding: 8px; border-top: 1px solid rgba(255,255,255,0.05); }
+
+  /* MAIN */
+  .main { flex: 1; display: flex; flex-direction: column; background: #0D0D0D; min-width: 0; }
+  .topbar {
+    height: 48px; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 16px; border-bottom: 1px solid rgba(255,255,255,0.05); flex-shrink: 0;
+  }
+  .search-box {
+    display: flex; align-items: center; gap: 8px;
+    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 24px; padding: 0 16px; height: 32px; width: 200px;
+  }
+  .search-box svg { width: 13px; height: 13px; opacity: 0.3; flex-shrink: 0; }
+  .search-placeholder { font-size: 12px; color: rgba(255,255,255,0.25); white-space: nowrap; }
+  .topbar-right { display: flex; align-items: center; gap: 16px; }
+  .slider-track { width: 72px; height: 3px; background: rgba(255,255,255,0.1); border-radius: 2px; position: relative; }
+  .slider-fill { width: 55%; height: 100%; background: #90FF21; border-radius: 2px; }
+  .slider-thumb { width: 10px; height: 10px; background: #90FF21; border-radius: 50%; position: absolute; top: -3.5px; left: 55%; transform: translateX(-50%); }
+  .ai-btn { width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border-radius: 8px; color: rgba(255,255,255,0.35); font-size: 15px; }
+  .zoom-row { display: flex; align-items: center; gap: 8px; }
+  .grid-area {
+    flex: 1; padding: 16px; overflow: hidden;
+    display: grid; grid-template-columns: repeat(3,1fr); grid-template-rows: 1fr 1fr; gap: 8px;
+  }
+  .card { border-radius: 8px; overflow: hidden; position: relative; border: 1px solid rgba(255,255,255,0.05); }
+  .card-tag { position: absolute; bottom: 8px; left: 8px; background: rgba(0,0,0,0.5); border-radius: 4px; padding: 2px 8px; font-size: 10px; color: rgba(255,255,255,0.65); }
+
+  /* INSPECTOR */
+  .inspector {
+    width: 256px; min-width: 256px;
+    background: #111111;
+    border-left: 1px solid rgba(255,255,255,0.05);
+    display: flex; flex-direction: column; overflow: hidden;
+    position: relative;
+  }
+
+  /* 顶部标题栏 */
+  .inspector-topbar {
+    height: 48px;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 16px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    flex-shrink: 0;
+    background: #111111;
+  }
+  .inspector-title { font-size: 12px; color: rgba(255,255,255,0.25); letter-spacing: 0.5px; }
+  .more-btn {
+    width: 32px; height: 32px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 8px; cursor: pointer;
+    color: rgba(255,255,255,0.3);
+    font-size: 16px; letter-spacing: 1px;
+    transition: all 0.15s;
+    position: relative;
+  }
+  .more-btn:hover { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.6); }
+  .more-btn.open { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.6); }
+
+  /* 下拉菜单 */
+  .dropdown {
+    position: absolute;
+    top: 48px; right: 8px;
+    width: 180px;
+    background: #1A1A1A;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    z-index: 100;
+    overflow: hidden;
+    display: none;
+  }
+  .dropdown.open { display: block; }
+  .menu-item {
+    padding: 9px 14px;
+    font-size: 12px; color: rgba(255,255,255,0.55);
+    cursor: pointer; transition: background 0.12s;
+  }
+  .menu-item:hover { background: rgba(255,255,255,0.05); color: rgba(255,255,255,0.8); }
+  .menu-item.danger { color: rgba(244,67,54,0.7); }
+  .menu-item.danger:hover { background: rgba(244,67,54,0.08); color: #F44336; }
+  .menu-divider { height: 1px; background: rgba(255,255,255,0.05); margin: 4px 0; }
+
+  .inspector-preview { width: 100%; height: 216px; background: #1A1A1A; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: rgba(255,255,255,0.04); font-size: 56px; }
+  .inspector-body { flex: 1; padding: 16px; overflow: hidden; }
+  .inspector-filename { font-size: 12px; font-weight: 500; color: rgba(255,255,255,0.75); margin-bottom: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .section-label { font-size: 10px; color: rgba(255,255,255,0.2); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .meta-row { display: flex; justify-content: space-between; margin-bottom: 8px; }
+  .meta-label { font-size: 11px; color: rgba(255,255,255,0.25); }
+  .meta-value { font-size: 11px; color: rgba(255,255,255,0.55); }
+  .divider { height: 1px; background: rgba(255,255,255,0.05); margin: 16px 0; }
+  .tags-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag { background: rgba(144,255,33,0.08); border: 1px solid rgba(144,255,33,0.15); border-radius: 4px; padding: 3px 8px; font-size: 11px; color: rgba(144,255,33,0.7); }
+  .colors-row { display: flex; gap: 6px; margin-top: 8px; }
+  .color-dot { width: 24px; height: 24px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.08); }
+</style>
+
+<div class="wrap">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-logo">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+        <rect x="2" y="2" width="9" height="9" rx="2" fill="#90FF21"/>
+        <rect x="13" y="2" width="9" height="9" rx="2" fill="#90FF21" opacity="0.4"/>
+        <rect x="2" y="13" width="9" height="9" rx="2" fill="#90FF21" opacity="0.4"/>
+        <rect x="13" y="13" width="9" height="9" rx="2" fill="#90FF21" opacity="0.2"/>
+      </svg>
+      <span class="logo-text">Gega</span>
+    </div>
+    <div class="sidebar-section">
+      <div class="nav-item active">
+        <svg viewBox="0 0 16 16" fill="none"><rect x="1" y="1" width="6" height="6" rx="1.5" fill="#90FF21"/><rect x="9" y="1" width="6" height="6" rx="1.5" fill="#90FF21"/><rect x="1" y="9" width="6" height="6" rx="1.5" fill="#90FF21"/><rect x="9" y="9" width="6" height="6" rx="1.5" fill="#90FF21"/></svg>
+        <span class="nav-label">灵感库</span>
+      </div>
+      <div class="nav-item">
+        <svg viewBox="0 0 16 16" fill="none"><path d="M8 1L9.5 5.5H14L10.5 8.5L11.5 13L8 10.5L4.5 13L5.5 8.5L2 5.5H6.5L8 1Z" stroke="rgba(255,255,255,0.4)" stroke-width="1.2" fill="none"/></svg>
+        <span class="nav-label">AI 提示词库</span>
+      </div>
+      <div class="nav-item">
+        <svg viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="2" rx="1" fill="rgba(255,255,255,0.35)"/><rect x="2" y="7" width="9" height="2" rx="1" fill="rgba(255,255,255,0.35)"/><rect x="2" y="11" width="11" height="2" rx="1" fill="rgba(255,255,255,0.35)"/></svg>
+        <span class="nav-label">作品集管理</span>
+      </div>
+      <div class="nav-item">
+        <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="rgba(255,255,255,0.4)" stroke-width="1.2"/><path d="M5 8h6M8 5v6" stroke="rgba(255,255,255,0.4)" stroke-width="1.2" stroke-linecap="round"/></svg>
+        <span class="nav-label">网页管理</span>
+      </div>
+      <div class="nav-divider"></div>
+      <div class="nav-item">
+        <svg viewBox="0 0 16 16" fill="none"><polyline points="2,12 6,8 9,11 14,5" stroke="rgba(255,255,255,0.4)" stroke-width="1.2" stroke-linecap="round" fill="none"/></svg>
+        <span class="nav-label">回收站</span>
+      </div>
+    </div>
+    <div class="sidebar-bottom">
+      <div class="nav-item">
+        <svg viewBox="0 0 16 16" fill="none" style="opacity:0.25"><circle cx="8" cy="8" r="3" stroke="rgba(255,255,255,0.9)" stroke-width="1.2"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41" stroke="rgba(255,255,255,0.9)" stroke-width="1.2" stroke-linecap="round"/></svg>
+        <span class="nav-label">设置</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+    <div class="topbar">
+      <div class="search-box">
+        <svg viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="rgba(255,255,255,0.8)" stroke-width="1.3"/><line x1="11" y1="11" x2="14" y2="14" stroke="rgba(255,255,255,0.8)" stroke-width="1.3" stroke-linecap="round"/></svg>
+        <span class="search-placeholder">搜索文件名、标签、提示词...</span>
+      </div>
+      <div class="topbar-right">
+        <div class="zoom-row">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="5" height="5" rx="1" fill="rgba(255,255,255,0.2)"/><rect x="9" y="2" width="5" height="5" rx="1" fill="rgba(255,255,255,0.2)"/><rect x="2" y="9" width="5" height="5" rx="1" fill="rgba(255,255,255,0.2)"/><rect x="9" y="9" width="5" height="5" rx="1" fill="rgba(255,255,255,0.2)"/></svg>
+          <div class="slider-track"><div class="slider-fill"></div><div class="slider-thumb"></div></div>
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="1" y="1" width="6" height="6" rx="1.2" fill="rgba(255,255,255,0.2)"/><rect x="9" y="1" width="6" height="6" rx="1.2" fill="rgba(255,255,255,0.2)"/><rect x="1" y="9" width="6" height="6" rx="1.2" fill="rgba(255,255,255,0.2)"/><rect x="9" y="9" width="6" height="6" rx="1.2" fill="rgba(255,255,255,0.2)"/></svg>
+          <div class="ai-btn">✦</div>
+        </div>
+      </div>
+    </div>
+    <div class="grid-area">
+      <div class="card" style="grid-row:span 2;background:linear-gradient(160deg,#1a0a2e,#2d1654);">
+        <div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,0.04);font-size:48px;">◈</div>
+        <span class="card-tag">WOO · 座位图</span>
+      </div>
+      <div class="card" style="background:linear-gradient(160deg,#0a1a2e,#163054);"><div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,0.04);font-size:28px;">◈</div></div>
+      <div class="card" style="background:linear-gradient(160deg,#1a2e0a,#2d5416);"><div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,0.04);font-size:28px;">◈</div></div>
+      <div class="card" style="background:linear-gradient(160deg,#2e1a0a,#543016);"><div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,0.04);font-size:28px;">◈</div></div>
+      <div class="card" style="background:linear-gradient(160deg,#0a2e2a,#165450);"><div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,0.04);font-size:28px;">◈</div></div>
+    </div>
+  </div>
+
+  <!-- Inspector -->
+  <div class="inspector" id="inspector">
+    <div class="inspector-topbar">
+      <span class="inspector-title">详情</span>
+      <div class="more-btn" id="moreBtn" onclick="toggleMenu()">···</div>
+    </div>
+
+    <!-- 下拉菜单 -->
+    <div class="dropdown" id="dropdown">
+      <div class="menu-item">在文件夹中显示</div>
+      <div class="menu-item">复制文件路径</div>
+      <div class="menu-divider"></div>
+      <div class="menu-item danger">移入回收站</div>
+    </div>
+
+    <div class="inspector-preview" style="background:linear-gradient(160deg,#1a0a2e,#2d1654);">◈</div>
+    <div class="inspector-body">
+      <div class="inspector-filename">WOO_seating_v3_final.png</div>
+      <div class="section-label">信息</div>
+      <div class="meta-row"><span class="meta-label">尺寸</span><span class="meta-value">2048 × 2048</span></div>
+      <div class="meta-row"><span class="meta-label">大小</span><span class="meta-value">3.2 MB</span></div>
+      <div class="meta-row"><span class="meta-label">格式</span><span class="meta-value">PNG</span></div>
+      <div class="divider"></div>
+      <div class="section-label">标签</div>
+      <div class="tags-row">
+        <span class="tag">WOO</span>
+        <span class="tag">座位图</span>
+        <span class="tag">赛博朋克</span>
+      </div>
+      <div class="divider"></div>
+      <div class="section-label">主色调</div>
+      <div class="colors-row">
+        <div class="color-dot" style="background:#2d1654;"></div>
+        <div class="color-dot" style="background:#7b3fa0;"></div>
+        <div class="color-dot" style="background:#c060e0;"></div>
+        <div class="color-dot" style="background:#1a0a2e;"></div>
+        <div class="color-dot" style="background:#4a1580;"></div>
+        <div class="color-dot" style="background:#e090ff;"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function toggleMenu() {
+  const btn = document.getElementById('moreBtn');
+  const dd = document.getElementById('dropdown');
+  const isOpen = dd.classList.contains('open');
+  if (isOpen) {
+    dd.classList.remove('open');
+    btn.classList.remove('open');
+  } else {
+    dd.classList.add('open');
+    btn.classList.add('open');
+  }
+}
+document.addEventListener('click', function(e) {
+  const btn = document.getElementById('moreBtn');
+  const dd = document.getElementById('dropdown');
+  if (!btn.contains(e.target) && !dd.contains(e.target)) {
+    dd.classList.remove('open');
+    btn.classList.remove('open');
+  }
+});
+</script>

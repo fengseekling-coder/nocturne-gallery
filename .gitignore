@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+src-tauri/target/
+src-tauri/.thumbs/
+
+# Build outputs
+dist/
+src-tauri/**/*.dll
+src-tauri/**/*.exe
+src-tauri/**/*.so
+src-tauri/**/*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+._*
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local agent/runtime artifacts
+.audit/
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+.claude/worktrees/
+.cursor/
+.lingma/
+.qoder/
+.qwen/
+.tmp/
+
+# Test and scratch outputs
+test-results/
+diff_*.txt
+*.recovered
+*.msi
+__pycache__/
+scripts/__pycache__/

@@ -1,0 +1,245 @@
+/*
+ * Nocturne Gallery — Global Styles
+ */
+
+@import './tokens.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ========== 基础重置 ========== */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100vh;
+  overflow: hidden;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-family);
+  font-size: 13px;
+  line-height: 1.5;
+  letter-spacing: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body,
+button,
+input,
+textarea,
+select,
+option,
+kbd {
+  font-family: var(--font-family);
+}
+
+/* ========== 全局 placeholder 颜色 ========== */
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-muted);
+  font-family: var(--font-family);
+}
+
+/* ========== 选择 & 滚动条 ========== */
+
+::selection {
+  background-color: var(--accent-dim);
+  color: var(--text-primary);
+}
+
+/* 自定义滚动条（暗黑风格） */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--border);
+  border-radius: var(--radius-pill);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--bg-hover);
+}
+
+/* ========== Tauri 窗口拖拽 ========== */
+
+[data-tauri-drag-region] {
+  cursor: move;
+  -webkit-app-region: drag;
+}
+
+[data-tauri-drag-region] button,
+[data-tauri-drag-region] input,
+[data-tauri-drag-region] a {
+  -webkit-app-region: no-drag;
+}
+
+/* ========== 通用工具类 ========== */
+
+.truncate-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* 隐藏 Inspector 内容区滚动条 */
+.inspector-content::-webkit-scrollbar {
+  display: none;
+}
+
+/* 隐藏 Canvas 内容区滚动条 */
+.canvas-content::-webkit-scrollbar {
+  display: none;
+}
+
+/* ========== 骨架屏 shimmer 动画 ========== */
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+/* ========== ToolCallCard 脉冲动画 ========== */
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* ========== Modal 入场动画 ========== */
+
+@keyframes modal-in {
+  from {
+    transform: translate(-50%, -50%) scale(0.96);
+    opacity: 0;
+  }
+  to {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 1;
+  }
+}
+
+/* ========== 平滑滚动 ========== */
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* ========== 减弱动效偏好支持 ========== */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ========== MediaCard ==========
+ * hover/selected/dragging/drag-preview 全部用 CSS class 表达，避免每张卡 useState
+ * 鼠标在网格里划过会经过几十张卡，每张走 React state 会触发同等数量 re-render
+ * 以下样式必须保持完整：MediaCard 主容器只设布局/边距，所有视觉态由 class 切换
+ */
+.media-card {
+  background-color: var(--bg-card);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+  transition: border-color 0.15s ease, transform 0.15s ease;
+  position: relative;
+  height: 100%;
+  width: 100%;
+}
+.media-card:hover:not(.is-selected):not(.is-dragging):not(.is-drag-preview) {
+  border-color: var(--border-hover);
+  transform: translateY(-1px);
+}
+.media-card.is-selected,
+.media-card.is-active,
+.media-card.is-drag-preview {
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.media-card.is-dragging {
+  opacity: 0.5;
+  cursor: grabbing;
+}
+
+/* ========== Canvas 缩放滑块 ========== */
+.zoom-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 72px;
+  height: 3px;
+  background: var(--slider-track);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+  position: relative;
+  z-index: 1;
+}
+.zoom-slider:focus {
+  outline: none;
+}
+.zoom-slider:focus-visible {
+  outline: none;
+}
+.zoom-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  transition: transform 0.1s ease;
+  margin-top: 0;
+}
+.zoom-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.3);
+}
+.zoom-slider::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+  cursor: pointer;
+}
+.zoom-slider::-webkit-slider-runnable-track {
+  height: 3px;
+  background: var(--slider-track);
+  border-radius: 2px;
+}
+.zoom-slider::-moz-range-track {
+  height: 3px;
+  background: var(--slider-track);
+  border-radius: 2px;
+}
+
+/* ========== 加载旋转动画 ========== */
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}

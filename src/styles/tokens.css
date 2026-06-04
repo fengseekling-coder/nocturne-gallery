@@ -1,0 +1,335 @@
+/*
+ * Nocturne Gallery — Design Tokens
+ *
+ * Gega Gallery v5.5 风格双主题系统
+ * - 深色主题：Arc-Inspired Minimalist，沉浸深色，品牌色 #90FF21
+ * - 浅色主题：明亮干净，品牌色 #72CC10
+ *
+ * 所有组件必须通过 var() 引用这些变量，禁止硬编码颜色值
+ */
+
+/* ========== 深色主题（默认） ========== */
+:root[data-theme="dark"] {
+  /* 背景色系 */
+  --fg1: rgba(255, 255, 255, 0.85);
+  --fg2: rgba(255, 255, 255, 0.45);
+  --fg3: rgba(255, 255, 255, 0.25);
+  --fg4: rgba(255, 255, 255, 0.14);
+  --bg-primary: #0D0D0D;
+  --bg-surface: #111111;
+  --bg-card: #161616;
+  --bg-muted: var(--bg-primary);
+  --bg-hover: rgba(255,255,255,0.04);
+  --bg-active: rgba(255,255,255,0.07);
+  --bg-mode-deep: #0A0A0A;
+  --bg-mode-default: #0D0D0D;
+  --bg-mode-light: #161616;
+
+  /* 文字色系 */
+  --text-primary: var(--fg1);
+  --text-secondary: var(--fg2);
+  --text-muted: var(--fg3);
+
+  /* 品牌色 */
+  --accent: #90FF21;
+  --accent-dim: rgba(144, 255, 33, 0.10);
+  --accent-soft: rgba(144, 255, 33, 0.10);
+  --accent-softer: rgba(144, 255, 33, 0.06);
+  --accent-border: rgba(144, 255, 33, 0.22);
+  --accent-active: rgba(144, 255, 33, 0.16);
+  --accent-glow: rgba(144, 255, 33, 0.18);
+  --accent-text: rgba(144, 255, 33, 0.92);
+  --text-on-accent: #0A0A0A;
+  --text-faint: rgba(255, 255, 255, 0.14);
+  --bg-elevated: #1a1a1a;
+  --error: #F44336;
+  --error-dim: color-mix(in srgb, var(--error) 12%, transparent);
+  --success: #22C55E;
+
+  /* 标签色板 */
+  --tag-red: #FF6B6B;
+  --tag-orange: #FF9F43;
+  --tag-yellow: #FFD93D;
+  --tag-green: #4ECDC4;
+  --tag-blue: #60AFFF;
+  --tag-purple: #A78BFA;
+  --tag-pink: #FF6B6B;
+
+  /* 边框 */
+  --border: rgba(255, 255, 255, 0.05);
+  --border-hover: rgba(255, 255, 255, 0.09);
+
+  /* 阴影 */
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5);
+
+  /* 遮罩层 */
+  --overlay-backdrop: rgba(0, 0, 0, 0.6);
+  --overlay-preview-backdrop: rgba(0, 0, 0, 0.86);
+  --overlay-action-bg: rgba(8, 8, 8, 0.82);
+  --overlay-chip: rgba(0, 0, 0, 0.58);
+  --overlay-chip-border: rgba(255, 255, 255, 0.08);
+  --overlay-text-strong: rgba(255, 255, 255, 0.92);
+  --overlay-gradient-bottom: linear-gradient(180deg, transparent 0%, rgba(0, 0, 0, 0.82) 100%);
+  --toast-bg: rgba(20, 20, 20, 0.92);
+
+  /* 交通灯按钮颜色（macOS 风格） */
+  --traffic-light-close: #FF5F57;
+  --traffic-light-minimize: #FEBC2E;
+  --traffic-light-maximize: #28C840;
+  --traffic-light-icon: #333333;
+
+  /* Windows 关闭按钮 hover 颜色 */
+  --windows-close-hover: #C42B1C;
+
+  /* 颜色块阴影 */
+  --shadow-color-swatch: 0 1px 2px rgba(0, 0, 0, 0.1), inset 0 0 0 1px var(--border);
+
+  /* 主题图标颜色 */
+  --color-icon-dark-mode: #FCD34D;
+  --color-icon-light-mode: #60A5FA;
+}
+
+/* ========== 浅色主题 ========== */
+:root[data-theme="light"] {
+  --fg1: #1A1A1A;
+  --fg2: #6B6968;
+  --fg3: #A8A7A6;
+  --fg4: rgba(0,0,0,0.18);
+
+  /* 背景色系 */
+  --bg-primary: #F5F4F2;
+  --bg-surface: #FFFFFF;
+  --bg-card: #FFFFFF;
+  --bg-elevated: #F0EFED;
+  --bg-muted: #E8E6E2;
+  --bg-hover: rgba(0,0,0,0.04);
+  --bg-active: rgba(0,0,0,0.07);
+  --bg-mode-deep: #0A0A0A;
+  --bg-mode-default: #0D0D0D;
+  --bg-mode-light: #161616;
+
+  /* 文字色系 */
+  --text-primary: var(--fg1);
+  --text-secondary: var(--fg2);
+  --text-muted: var(--fg3);
+  --text-faint: var(--fg4);
+
+  /* 品牌色 */
+  --accent: #72CC10;
+  --accent-soft: rgba(114, 204, 16, 0.10);
+  --accent-softer: rgba(114, 204, 16, 0.06);
+  --accent-border: rgba(114, 204, 16, 0.28);
+  --accent-glow: rgba(114, 204, 16, 0.18);
+  --accent-text: rgba(114, 204, 16, 0.9);
+  --accent-dim: rgba(114, 204, 16, 0.12);
+  --accent-active: rgba(114, 204, 16, 0.16);
+  --error: #F44336;
+  --error-dim: color-mix(in srgb, var(--error) 12%, transparent);
+  --success: #22C55E;
+
+  /* 标签色板 */
+  --tag-red: #FF6B6B;
+  --tag-orange: #FF9F43;
+  --tag-yellow: #FFD93D;
+  --tag-green: #4ECDC4;
+  --tag-teal: #4ECDC4;
+  --tag-blue: #60AFFF;
+  --tag-purple: #A78BFA;
+  --tag-pink: #FF6B6B;
+
+  /* 边框 */
+  --border: rgba(0, 0, 0, 0.08);
+  --border-hover: rgba(0, 0, 0, 0.12);
+  --border-strong: rgba(0, 0, 0, 0.12);
+
+  /* 阴影 */
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.12);
+
+  /* 遮罩层 */
+  --overlay-backdrop: rgba(0, 0, 0, 0.5);
+  --overlay-preview-backdrop: rgba(0, 0, 0, 0.86);
+  --overlay-action-bg: rgba(8, 8, 8, 0.82);
+  --overlay-chip: rgba(0, 0, 0, 0.58);
+  --overlay-chip-border: rgba(255, 255, 255, 0.08);
+  --overlay-text-strong: rgba(255, 255, 255, 0.92);
+  --overlay-gradient-bottom: linear-gradient(180deg, transparent 0%, rgba(0, 0, 0, 0.70) 100%);
+  --toast-bg: rgba(26, 26, 26, 0.92);
+
+  /* accent 色背景上的文字 */
+  --text-on-accent: #0A0A0A;
+
+  /* 交通灯按钮颜色（macOS 风格） */
+  --traffic-light-close: #FF5F57;
+  --traffic-light-minimize: #FEBC2E;
+  --traffic-light-maximize: #28C840;
+  --traffic-light-icon: #333333;
+
+  /* Windows 关闭按钮 hover 颜色 */
+  --windows-close-hover: #C42B1C;
+
+  /* 颜色块阴影 */
+  --shadow-color-swatch: 0 1px 2px rgba(0, 0, 0, 0.08), inset 0 0 0 1px var(--border);
+
+  /* 主题图标颜色 */
+  --color-icon-dark-mode: #FCD34D;
+  --color-icon-light-mode: #60A5FA;
+}
+
+/* ========== 全局 Token 别名（两套主题通用） ========== */
+:root {
+  /* 向后兼容别名 */
+  --color-bg-base: var(--bg-primary);
+  --color-bg-primary: var(--bg-primary);
+  --color-bg-structure: var(--bg-surface);
+  --color-bg-sidebar: var(--bg-primary);
+  --color-bg-detail: var(--bg-primary);
+  --color-bg-card: var(--bg-card);
+  --color-bg-hover: var(--bg-hover);
+  --color-bg-active: var(--bg-active);
+  --color-bg-input: var(--bg-card);
+  --color-accent: var(--accent);
+  --color-accent-end: var(--accent);
+  --color-accent-dim: var(--accent-dim);
+  --color-accent-active: var(--accent-active);
+  --color-accent-glow: var(--accent-glow);
+  --on-surface: var(--text-primary);
+  --on-surface-secondary: var(--text-secondary);
+  --on-surface-muted: var(--text-muted);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted: var(--text-muted);
+  --color-text-disabled: var(--text-faint);
+  --color-text-inverse: var(--text-on-accent);
+  --color-text-accent: var(--accent);
+  --color-outline-variant: var(--border);
+  --color-border: var(--border);
+  --color-border-subtle: var(--border);
+  --color-border-focus: var(--accent);
+  --color-border-hover: var(--border);
+  --color-error: var(--error);
+  --color-error-dim: var(--error-dim);
+  --color-success: var(--success);
+  --color-success-dim: color-mix(in srgb, var(--success) 12%, transparent);
+  --color-warning: #FFB800;
+  --color-warning-dim: color-mix(in srgb, var(--color-warning) 12%, transparent);
+  --color-info: #60AFFF;
+  --color-info-dim: color-mix(in srgb, var(--color-info) 12%, transparent);
+  --color-tag-red: var(--tag-red);
+  --color-tag-orange: var(--tag-orange);
+  --color-tag-yellow: var(--tag-yellow);
+  --color-tag-green: var(--tag-green);
+  --color-tag-teal: var(--tag-teal);
+  --color-tag-blue: var(--tag-blue);
+  --color-tag-purple: var(--tag-purple);
+  --color-tag-pink: var(--tag-pink);
+
+  /* ========== 圆角 ========== */
+  --radius-default: 8px;
+  --radius-small: 8px;
+  --radius-pill: 9999px;
+  --radius-card: 8px;
+  --radius-media-card: 10px;
+  --radius-control: 4px;
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+  --radius-panel: 16px;
+
+  /* ========== 过渡 ========== */
+  --transition-default: 150ms ease;
+  --transition-fast: 100ms ease;
+  --transition-slow: 300ms ease;
+
+  /* ========== 布局尺寸 ========== */
+  --sidebar-width: 192px;
+  --detail-width: 256px;
+  --toolbar-height: 48px;
+  --card-gap: 8px;
+  --card-image-height: 180px;
+
+  /* ========== 组件专用 Token ========== */
+  --slider-track: rgba(255, 255, 255, 0.1);
+
+  /* ========== 字体 ========== */
+  --font-family: 'Microsoft YaHei', '微软雅黑', 'PingFang SC', sans-serif;
+  --font-mono: var(--font-family);
+  --font-size-xs: 10px;
+  --font-size-sm: 11px;
+  --font-size-base: 13px;
+  --font-size-md: 14px;
+  --font-size-lg: 15px;
+  --font-size-xl: 16px;
+  --font-size-2xl: 20px;
+  --font-size-3xl: 22px;
+  --tracking-tight: -0.02em;
+  --tracking-snug: -0.005em;
+  --tracking-wide: 0.05em;
+  --tracking-wider: 0.14em;
+
+  /* ========== 阴影 ========== */
+  --shadow-float: var(--shadow-lg);
+  --shadow-card-hover: 0 6px 20px rgba(0, 0, 0, 0.5);
+  --shadow-glow-accent: 0 6px 24px var(--accent-glow);
+
+  /* ========== Z-Index 层级 ========== */
+  --z-base: 0;
+  --z-card-hover: 10;
+  --z-toolbar: 100;
+  --z-sidebar: 200;
+  --z-detail: 200;
+  --z-modal: 500;
+  --z-toast: 600;
+  --z-tooltip: 700;
+}
+
+:root[data-platform='macos'] {
+  --font-family: 'PingFang SC', 'Microsoft YaHei', '微软雅黑', sans-serif;
+}
+
+/* ========== Body 基础样式 ========== */
+body {
+  font-family: var(--font-family);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background-color: var(--bg-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ========== 全局边框重置（移除所有默认边框） ========== */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+button,
+.button,
+[role="button"] {
+  border: none;
+  outline: none;
+  /* 不用 !important，允许组件通过 inline style 或 CSS 设置 box-shadow */
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+}
+
+button::-moz-focus-inner,
+.button::-moz-focus-inner,
+[role="button"]::-moz-focus-inner {
+  border: 0 !important;
+  padding: 0 !important;
+}
+
+button:focus,
+.button:focus,
+[role="button"]:focus {
+  outline: none !important;
+  border: none !important;
+}
