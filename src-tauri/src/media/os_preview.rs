@@ -1,18 +1,20 @@
 //! 系统级文件预览（Quick Look / 后续可扩展 Windows Shell），用于 PSD/AI 等无内嵌缩略图时。
 
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 /// 尝试从操作系统获取预览图原始字节（PNG/JPEG）。
 pub fn fetch_os_preview_bytes(filepath: &str, size: u32) -> Option<Vec<u8>> {
-    let path = crate::media::path_util::resolve_regular_file_path(filepath)?;
     #[cfg(target_os = "macos")]
     {
+        let path = crate::media::path_util::resolve_regular_file_path(filepath)?;
         macos_quicklook_preview_bytes(&path, size)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = size;
+        let _ = (filepath, size);
         None
     }
 }

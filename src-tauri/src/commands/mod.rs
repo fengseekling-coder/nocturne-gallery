@@ -28,8 +28,7 @@ pub struct BatchFileOperationResult {
     pub first_error: Option<String>,
 }
 
-#[command]
-pub fn start_file_drag(window: tauri::Window, paths: Vec<String>) -> Result<(), String> {
+fn collect_file_drag_paths(paths: Vec<String>) -> Result<Vec<PathBuf>, String> {
     if paths.is_empty() {
         return Err("没有可拖出的文件".to_string());
     }
@@ -44,19 +43,41 @@ pub fn start_file_drag(window: tauri::Window, paths: Vec<String>) -> Result<(), 
         drag_paths.push(path_buf);
     }
 
+    Ok(drag_paths)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn start_native_file_drag(window: &tauri::Window, drag_paths: Vec<PathBuf>) -> Result<(), String> {
     let preview = drag_paths
         .first()
         .cloned()
         .ok_or_else(|| "没有可拖出的文件".to_string())?;
 
     drag::start_drag(
-        &window,
+        window,
         drag::DragItem::Files(drag_paths),
         drag::Image::File(preview),
         |_result, _cursor_position| {},
         drag::Options::default(),
     )
     .map_err(|e| format!("启动系统拖拽失败：{}", e))
+}
+
+#[command]
+pub fn start_file_drag(window: tauri::Window, paths: Vec<String>) -> Result<(), String> {
+    let drag_paths = collect_file_drag_paths(paths)?;
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        start_native_file_drag(&window, drag_paths)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = window;
+        let _ = drag_paths;
+        Err("当前平台暂不支持从应用拖出文件".to_string())
+    }
 }
 
 fn media_id_by_filepath(conn: &rusqlite::Connection, filepath: &str) -> Result<String, String> {
