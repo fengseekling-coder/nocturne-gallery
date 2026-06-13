@@ -80,6 +80,7 @@ fn macos_quicklook_preview_bytes(path: &Path, size: u32) -> Option<Vec<u8>> {
     bytes.filter(|b| !b.is_empty())
 }
 
+#[cfg(target_os = "macos")]
 fn uuid_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
