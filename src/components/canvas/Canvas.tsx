@@ -1,7 +1,7 @@
 /*
- * Nocturne Gallery — Canvas
+ * Gega Gallery — Canvas
  *
- * 瀑布流布局：CSS columns 实现，卡片无文字纯图片
+ * 瀑布流布局：JS Masonry（多列 + 按原图宽高比算高度），卡片无文字纯图片
  * 灵感库、作品集、AI 提示词库使用瀑布流，回收站保持网格
  */
 
@@ -10,7 +10,7 @@ import { useMediaStore } from '../../stores/mediaStore';
 import { useUiStore } from '../../stores/uiStore';
 import { useContextMenuStore } from '../../stores/contextMenuStore';
 import { invoke } from '@tauri-apps/api/core';
-import { convertFileSrc } from '@tauri-apps/api/core';
+
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { MediaCard } from './MediaCard';
@@ -18,13 +18,34 @@ import { TopToolbar } from './TopToolbar';
 import { ContextMenu } from '../common/ContextMenu/ContextMenu';
 import { Icon } from '../common/Icon';
 import { WindowControls } from '../common/WindowControls';
+import { detectUiPlatform } from '../../lib/platform';
 // FullScreenPreview 内嵌在 Canvas 中，不再单独导入
 import { DuplicateModal } from '../common/DuplicateModal';
 import type { ContextMenuAction } from '../../types/context-menu';
 import type { MediaFile } from '../../types/media';
 import type { DuplicateInfo, DuplicateAction } from '../common/DuplicateModal';
 import { loadFullResolution } from '../../lib/loadFullResolution';
+import { pickGridThumbnailPath } from '../../lib/gridThumbnail';
+import { preloadPreviewDiskPath } from '../../lib/previewImageReady';
+import { getAssetUrl } from '../../lib/thumbnailCache';
 import { notifyCanvasScrollActivity } from '../../lib/scrollActivityBus';
+
+
+/** 与属性面板 / 网格一致：优先 micro/standard，避免无效的 preview 档路径导致大图问号 */
+function resolvePreviewInstantDiskPath(file: MediaFile): string {
+  const tiered = pickGridThumbnailPath(file);
+  if (tiered) return tiered;
+  const preview = file.thumbnailPreviewPath?.trim();
+  if (preview) return preview;
+  return file.filepath?.trim() ?? '';
+}
+
+function resolvePreviewUpgradeDiskPath(file: MediaFile): string | null {
+  const preview = file.thumbnailPreviewPath?.trim();
+  if (preview) return preview;
+  const filepath = file.filepath?.trim();
+  return filepath || null;
+}
 
 
 // ----------------------------------------------------------------
@@ -64,6 +85,7 @@ interface MasonryLayoutCache {
 interface BatchFileOperationResult {
   succeeded: number;
   failed: number;
+  first_error?: string | null;
 }
 
 interface NativeDropPosition {
@@ -210,6 +232,25 @@ const scaleIndicatorStyle: React.CSSProperties = {
 const gridWrapperStyle: React.CSSProperties = {
   flex: 1, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden',
 };
+/** 大图/附件预览时保留网格 DOM，仅隐藏，避免返回时整页重挂导致缩略图短暂空白 */
+const gridHiddenWhilePreviewStyle: React.CSSProperties = {
+  position: 'absolute',
+  inset: 0,
+  flex: 'none',
+  visibility: 'hidden',
+  pointerEvents: 'none',
+  overflow: 'hidden',
+  zIndex: 0,
+};
+const previewLayerStyle: React.CSSProperties = {
+  flex: 1,
+  display: 'flex',
+  flexDirection: 'column',
+  height: '100%',
+  position: 'relative',
+  zIndex: 2,
+  minHeight: 0,
+};
 const contentScrollStyle: React.CSSProperties = {
   flex: 1,
   overflowY: 'auto',
@@ -246,11 +287,6 @@ interface ImportSkippedPayload {
   filename: string;
   targetFolder?: string;
   reason: 'existing-file';
-}
-
-interface ImportIndexCommittedPayload {
-  current: number;
-  total: number;
 }
 
 interface ImportPathsPayload {
@@ -295,6 +331,7 @@ export const Canvas: React.FC<CanvasProps> = () => {
   const sourceFolder = useUiStore((s) => s.sourceFolder);
   const showToast = useUiStore((s) => s.showToast);
   const columnCount = useUiStore((s) => s.columnCount);
+  const isMacUi = detectUiPlatform() === 'macos';
   const showConfirm = useUiStore((s) => s.showConfirm);
   const targetFileId = useContextMenuStore((s) => s.targetFileId);
   const hideMenu = useContextMenuStore((s) => s.hideMenu);
@@ -326,6 +363,7 @@ export const Canvas: React.FC<CanvasProps> = () => {
   const [previewDisplaySrc, setPreviewDisplaySrc] = useState<string>('');
   const [isLoadingPreviewOriginal, setIsLoadingPreviewOriginal] = useState(false);
   const previewOriginalAbortRef = useRef<AbortController | null>(null);
+  const previewImageErrorPathsRef = useRef<Set<string>>(new Set());
   const currentPreviewFile = viewMode === 'preview' ? files[previewIndex] ?? null : null;
   const isAttachmentPreviewMode = canvasAttachmentPreview !== null;
   const isAnyPreviewMode = viewMode === 'preview' || isAttachmentPreviewMode;
@@ -335,10 +373,32 @@ export const Canvas: React.FC<CanvasProps> = () => {
       ?? null,
     [canvasAttachmentPreview],
   );
-  const previewResolvedSrc = useMemo(
-    () => (previewDisplaySrc ? convertFileSrc(previewDisplaySrc) : ''),
-    [previewDisplaySrc],
-  );
+  const previewResolvedSrc = useMemo(() => {
+    const disk = previewDisplaySrc.trim()
+      || (currentPreviewFile ? resolvePreviewInstantDiskPath(currentPreviewFile) : '');
+    if (!disk) return '';
+    return getAssetUrl(disk);
+  }, [previewDisplaySrc, currentPreviewFile]);
+
+  const handleMainPreviewImageError = useCallback(() => {
+    if (!currentPreviewFile) return;
+    const chain = [
+      pickGridThumbnailPath(currentPreviewFile),
+      currentPreviewFile.thumbnailPreviewPath?.trim(),
+      currentPreviewFile.thumbnailPath?.trim(),
+      currentPreviewFile.thumbnailMicroPath?.trim(),
+      currentPreviewFile.filepath?.trim(),
+    ].filter((p): p is string => !!p && p.length > 0);
+    const uniqueChain = [...new Set(chain)];
+    const current = previewDisplaySrc.trim() || resolvePreviewInstantDiskPath(currentPreviewFile);
+    previewImageErrorPathsRef.current.add(current);
+    const next = uniqueChain.find(
+      (p) => p !== current && !previewImageErrorPathsRef.current.has(p),
+    );
+    if (next) {
+      setPreviewDisplaySrc(next);
+    }
+  }, [currentPreviewFile, previewDisplaySrc]);
 
   // 搜索状态
   const [searchQuery, setSearchQuery] = useState('');
@@ -507,7 +567,11 @@ export const Canvas: React.FC<CanvasProps> = () => {
       window.requestAnimationFrame(() => {
         void useMediaStore.getState().focusFile(nextFile.id);
       });
-      releasePreviewResources(true);
+      previewImageErrorPathsRef.current.clear();
+      const instant = resolvePreviewInstantDiskPath(nextFile);
+      setPreviewDisplaySrc(instant);
+      void preloadPreviewDiskPath(instant);
+      releasePreviewResources(false);
     }
   }, [previewIndex, files, releasePreviewResources]);
 
@@ -525,7 +589,11 @@ export const Canvas: React.FC<CanvasProps> = () => {
       window.requestAnimationFrame(() => {
         void useMediaStore.getState().focusFile(prevFile.id);
       });
-      releasePreviewResources(true);
+      previewImageErrorPathsRef.current.clear();
+      const instant = resolvePreviewInstantDiskPath(prevFile);
+      setPreviewDisplaySrc(instant);
+      void preloadPreviewDiskPath(instant);
+      releasePreviewResources(false);
     }
   }, [previewIndex, files, releasePreviewResources]);
 
@@ -547,25 +615,40 @@ export const Canvas: React.FC<CanvasProps> = () => {
     };
   }, [handleWheel]);
 
+  const currentPreviewFileId = currentPreviewFile?.id ?? null;
+
   useEffect(() => {
-    if (!currentPreviewFile) {
+    if (!currentPreviewFileId) {
       releasePreviewResources(true);
       previewSelectionPendingRef.current = null;
       previewPerfStartRef.current = null;
+      previewImageErrorPathsRef.current.clear();
       return;
     }
 
+    const file = useMediaStore.getState().files.find((f) => f.id === currentPreviewFileId);
+    if (!file) {
+      return;
+    }
+
+    previewImageErrorPathsRef.current.clear();
     releasePreviewResources(false);
 
     const abort = new AbortController();
     previewOriginalAbortRef.current = abort;
 
     previewUnloadRef.current = loadFullResolution({
-      imagePath: currentPreviewFile.filepath,
-      thumbnailPreviewPath: currentPreviewFile.thumbnailPreviewPath,
-      originalDelayMs: 120,
+      imagePath: file.filepath,
+      thumbnailPreviewPath: file.thumbnailPreviewPath,
+      initialDiskPath: resolvePreviewInstantDiskPath(file),
+      upgradeDiskPath: resolvePreviewUpgradeDiskPath(file),
+      originalDelayMs: 520,
+      upgradeDelayMs: 140,
       signal: abort.signal,
-      onDisplayPathChange: setPreviewDisplaySrc,
+      onDisplayPathChange: (diskPath) => {
+        if (previewImageErrorPathsRef.current.has(diskPath.trim())) return;
+        setPreviewDisplaySrc(diskPath);
+      },
       onLoadingOriginalChange: setIsLoadingPreviewOriginal,
     });
 
@@ -577,7 +660,7 @@ export const Canvas: React.FC<CanvasProps> = () => {
       }
       previewOriginalAbortRef.current = null;
     };
-  }, [currentPreviewFile, releasePreviewResources]);
+  }, [currentPreviewFileId, releasePreviewResources]);
 
   useEffect(() => {
     if (!canvasAttachmentPreview) {
@@ -1012,15 +1095,16 @@ export const Canvas: React.FC<CanvasProps> = () => {
       showToast(`素材已存在，已跳过：${skippedName}`);
     });
 
-    const unlistenImportIndexCommitted = listen<ImportIndexCommittedPayload>('import_index_committed', (event) => {
-      if (event.payload.current > 0) {
-        scheduleListRefresh('import-index-committed', 250);
+    // 不在 index 阶段刷新：此时文件可能尚未复制，缩略图路径指向未落盘路径会导致网格永久占位
+    const unlistenImportComplete = listen<{ total: number }>('import_complete', (event) => {
+      if (event.payload.total > 0) {
+        scheduleListRefresh('import-complete', 200);
       }
     });
 
     return () => {
       unlistenImportSkipped.then((unlistenEvent) => unlistenEvent());
-      unlistenImportIndexCommitted.then((unlistenEvent) => unlistenEvent());
+      unlistenImportComplete.then((unlistenEvent) => unlistenEvent());
     };
   }, [scheduleListRefresh, showToast]);
 
@@ -1096,21 +1180,65 @@ export const Canvas: React.FC<CanvasProps> = () => {
 
     const targetFolder = dropTarget?.targetFolder ?? getImportTargetFolder();
     const targetCategory = dropTarget?.targetCategory ?? getImportTargetCategory();
+    const reportBatchImportResult = (result: ImportPathsPayload) => {
+      if (result.failedCount > 0) {
+        showToast(`导入失败 ${result.failedCount} 项`);
+        return;
+      }
+      if (result.importedCount === 0 && result.skippedCount > 0) {
+        showToast(`已跳过 ${result.skippedCount} 个已存在或不支持的素材`);
+      }
+    };
 
     if (uniquePaths.length > 1) {
-      try {
-        const result = await invoke<ImportPathsPayload>('import_paths_to_library', {
-          sourcePaths: uniquePaths,
+      const pathsToImportDirect: string[] = [];
+      for (const path of uniquePaths) {
+        let fileInfoBatch: FileInfoPayload;
+        try {
+          fileInfoBatch = await invoke<FileInfoPayload>('get_file_info', { path });
+        } catch {
+          pathsToImportDirect.push(path);
+          continue;
+        }
+        if (fileInfoBatch.isDir) {
+          pathsToImportDirect.push(path);
+          continue;
+        }
+        if (fileInfoBatch.size > SINGLE_FILE_DUPLICATE_CHECK_MAX_BYTES) {
+          pathsToImportDirect.push(path);
+          continue;
+        }
+        const duplicateCheck = await checkFileDuplicate(path);
+        const pending = createPendingDuplicateImport(
+          path,
           targetFolder,
           targetCategory,
-        });
-
-        if (result.failedCount > 0) {
-          showToast(`导入失败 ${result.failedCount} 项`);
+          fileInfoBatch.size,
+          duplicateCheck,
+        );
+        if (pending) {
+          try {
+            await processPendingDuplicateImport(pending);
+          } catch (error) {
+            canvasDebugError('[Canvas] Batch duplicate resolution failed:', path, error);
+            showToast('重复素材处理失败');
+          }
+        } else {
+          pathsToImportDirect.push(path);
         }
-      } catch (error) {
-        canvasDebugError('[Canvas] Batch import failed:', uniquePaths, error);
-        showToast('批量导入失败');
+      }
+      if (pathsToImportDirect.length > 0) {
+        try {
+          const result = await invoke<ImportPathsPayload>('import_paths_to_library', {
+            sourcePaths: pathsToImportDirect,
+            targetFolder,
+            targetCategory,
+          });
+          reportBatchImportResult(result);
+        } catch (error) {
+          canvasDebugError('[Canvas] Batch import failed:', pathsToImportDirect, error);
+          showToast('批量导入失败');
+        }
       }
       scheduleListRefresh('drag-drop-import');
       return;
@@ -1162,9 +1290,7 @@ export const Canvas: React.FC<CanvasProps> = () => {
           targetCategory,
         });
 
-        if (result.failedCount > 0) {
-          showToast(`导入失败 ${result.failedCount} 项`);
-        }
+        reportBatchImportResult(result);
       } catch (error) {
         canvasDebugError('[Canvas] Batch import failed:', batchedImportPaths, error);
         showToast('批量导入失败');
@@ -1436,9 +1562,10 @@ export const Canvas: React.FC<CanvasProps> = () => {
 
   // Masonry 核心算法：N 列瀑布流（最短列优先），columnCount 直接控制列数
   const MASONRY_GAP = 4;
+  const masonryColumnCount = Math.max(2, Math.min(6, Number(columnCount) || 4));
   const columnWidth = containerWidth > 0
-    ? Math.floor((containerWidth - (columnCount - 1) * MASONRY_GAP) / columnCount)
-    : Math.floor((400 - (columnCount - 1) * MASONRY_GAP) / columnCount);
+    ? Math.floor((containerWidth - (masonryColumnCount - 1) * MASONRY_GAP) / masonryColumnCount)
+    : Math.floor((400 - (masonryColumnCount - 1) * MASONRY_GAP) / masonryColumnCount);
   const masonryLayout = useMemo(() => {
     const perfStart = isDev ? performance.now() : 0;
     if (columnWidth === 0 || files.length === 0) {
@@ -1447,39 +1574,48 @@ export const Canvas: React.FC<CanvasProps> = () => {
     }
 
     const previous = layoutCacheRef.current;
-    // O(1) 首尾引用校验代替 O(n) every()：翻页追加时 spread 保留旧引用，
-    // files[0] 和 files[prevLen-1] 与缓存一致即前缀未变
+    const layoutSignature = (f: MediaFile) => `${f.id}:${f.width ?? 0}:${f.height ?? 0}`;
+
+    if (
+      previous !== null &&
+      previous.columnCount === masonryColumnCount &&
+      previous.columnWidth === columnWidth &&
+      files.length === previous.files.length &&
+      files.every((f, i) => layoutSignature(f) === layoutSignature(previous.files[i]))
+    ) {
+      layoutCacheRef.current = { ...previous, files };
+      return { positions: previous.positions, totalHeight: previous.totalHeight };
+    }
+
     const canAppendIncrementally =
       previous !== null &&
-      previous.columnCount === columnCount &&
+      previous.columnCount === masonryColumnCount &&
       previous.columnWidth === columnWidth &&
-      files.length >= previous.files.length &&
+      files.length > previous.files.length &&
       previous.files.length > 0 &&
       files[0] === previous.files[0] &&
       files[previous.files.length - 1] === previous.files[previous.files.length - 1];
 
-    // 标准 N 列 Masonry：每列等宽，图片高度由宽高比决定
-    // 仅在分页追加且前缀未变时复用旧布局，否则全量重算
     const colHeights = canAppendIncrementally
-      ? [...previous.columnHeights]
-      : new Array<number>(columnCount).fill(0);
+      ? [...previous!.columnHeights]
+      : new Array<number>(masonryColumnCount).fill(0);
     const positions: MasonryPosition[] = canAppendIncrementally
-      ? previous.positions.slice()
+      ? previous!.positions.slice()
       : new Array(files.length);
-    const startIndex = canAppendIncrementally ? previous.files.length : 0;
+    const startIndex = canAppendIncrementally ? previous!.files.length : 0;
 
     for (let i = startIndex; i < files.length; i++) {
       const file = files[i];
-      // 找最短列
+      // 找最短列（Pinterest 式瀑布流）
       let shortestCol = 0;
-      for (let c = 1; c < columnCount; c++) {
+      for (let c = 1; c < masonryColumnCount; c++) {
         if (colHeights[c] < colHeights[shortestCol]) shortestCol = c;
       }
 
       const x = shortestCol * (columnWidth + MASONRY_GAP);
       const y = colHeights[shortestCol];
 
-      // 根据原图宽高比计算卡片高度；缺失尺寸信息时使用中性 1:1，避免强行按竖图布局
+      // 列宽固定，高度 = 列宽 / 原图宽高比
       const ratio = file.width && file.height && file.width > 0 && file.height > 0
         ? file.width / file.height
         : 1;
@@ -1495,7 +1631,7 @@ export const Canvas: React.FC<CanvasProps> = () => {
       files,
       positions,
       columnHeights: colHeights,
-      columnCount,
+      columnCount: masonryColumnCount,
       columnWidth,
       totalHeight,
     };
@@ -1508,7 +1644,7 @@ export const Canvas: React.FC<CanvasProps> = () => {
     }
 
     return { positions, totalHeight };
-  }, [files, columnCount, columnWidth]);
+  }, [files, masonryColumnCount, columnWidth]);
 
   const positionedCards = useMemo<PositionedCard[]>(() => {
     const perfStart = isDev ? performance.now() : 0;
@@ -1681,9 +1817,9 @@ export const Canvas: React.FC<CanvasProps> = () => {
 
   const mainStyle = useMemo<React.CSSProperties>(() => ({
     flex: 1, display: 'flex', flexDirection: 'column', height: '100%',
-    overflow: viewMode === 'grid' ? 'auto' : 'hidden',
+    overflow: 'hidden',
     backgroundColor: 'var(--bg-primary)', position: 'relative',
-  }), [viewMode]);
+  }), []);
 
   const previewContainerStyle = useMemo<React.CSSProperties>(() => ({
     flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1719,18 +1855,22 @@ export const Canvas: React.FC<CanvasProps> = () => {
     // 不加 transition：新一页加载时容器高度骤变，transition:'all' 会引发卡顿和闪烁
   }), [masonryLayout.totalHeight]);
 
-  const openPreviewForFile = useCallback(async (file: MediaFile) => {
+  const openPreviewForFile = useCallback((file: MediaFile) => {
     const idx = files.findIndex((candidate) => candidate.id === file.id);
     if (idx === -1) return;
 
     closeCanvasAttachmentPreview();
     setScrollY(contentRef.current?.scrollTop || 0);
     setSelectedIds([file.id]);
-    await useMediaStore.getState().focusFile(file.id);
-    startTransition(() => {
-      setPreviewIndex(idx);
-      setViewMode('preview');
-    });
+    previewImageErrorPathsRef.current.clear();
+    const instant = resolvePreviewInstantDiskPath(file);
+    setPreviewDisplaySrc(instant);
+    setPreviewIndex(idx);
+    setScale(1);
+    setOffset({ x: 0, y: 0 });
+    setViewMode('preview');
+    void preloadPreviewDiskPath(instant);
+    void useMediaStore.getState().focusFile(file.id);
   }, [closeCanvasAttachmentPreview, files, setSelectedIds]);
 
   // 处理右键菜单动作
@@ -1781,7 +1921,7 @@ export const Canvas: React.FC<CanvasProps> = () => {
             // 触发回收站更新事件，让回收站视图知道有新项目
             window.dispatchEvent(new CustomEvent('trash-updated'));
           } else {
-            showToast('移入回收站失败');
+            showToast(result.first_error?.trim() || '移入回收站失败');
           }
           break;
         }
@@ -2181,9 +2321,108 @@ export const Canvas: React.FC<CanvasProps> = () => {
         </div>
       )}
 
-      {/* 渲染预览模式 */}
+      {/* 网格常驻 DOM；预览时仅隐藏，避免返回后缩略图重载闪烁 */}
+      <div
+        style={
+          isAnyPreviewMode
+            ? { ...gridWrapperStyle, ...gridHiddenWhilePreviewStyle }
+            : gridWrapperStyle
+        }
+        aria-hidden={isAnyPreviewMode}
+      >
+        <TopToolbar
+          count={totalCount}
+          searchQuery={searchQuery}
+          onSearchQueryChange={setSearchQuery}
+        />
+
+        <div
+          ref={contentRef}
+          className="canvas-content"
+          style={contentScrollStyle}
+          onClick={handleBackgroundClick}
+        >
+          {isEmpty && (
+            <div style={emptyStateStyle}>
+              <Icon name={isTrash ? 'delete_sweep' : 'folder_open'} size={42} style={emptyIconStyle} />
+              <p style={emptyTextStyle}>{isEmptyStateText}</p>
+            </div>
+          )}
+
+          {!isEmpty && (
+            <div style={masonryContainerStyle}>
+              {renderCards.map(({ file, pos }, index) => {
+                const wrapperStyle: React.CSSProperties = {
+                  position: 'absolute',
+                  left: pos.x,
+                  top: pos.y,
+                  width: pos.width,
+                  height: pos.height,
+                  contain: 'layout paint style',
+                };
+
+                if (USE_VIRTUAL) {
+                  const isFarFromViewport = viewportHeight > 0
+                    ? Math.abs((pos.y + pos.height / 2) - (scrollTop + viewportHeight / 2)) > viewportHeight * 1.25
+                    : false;
+                  if (isFarFromViewport) {
+                    wrapperStyle.opacity = 0.999;
+                    wrapperStyle.contentVisibility = 'auto';
+                    wrapperStyle.containIntrinsicSize = `${pos.width}px ${pos.height}px`;
+                  }
+                }
+
+                return (
+                  <div
+                    key={file.id}
+                    style={wrapperStyle}
+                  >
+                    <MediaCard
+                      file={file}
+                      isInitiallyVisible={!USE_VIRTUAL ? true : index < EAGER_CARD_COUNT}
+                      onDragStart={handleCardDragStart}
+                      onDragEnd={handleCardDragEnd}
+                      onDoubleClick={handleDoubleClick}
+                      observe={observeElement}
+                      unobserve={unobserveElement}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {shouldShowLoadMoreDots && (
+            <div style={loadingDotsWrapperStyle}>
+              {[0, 1, 2].map(i => (
+                <div
+                  key={i}
+                  style={{
+                    width: '8px', height: '8px', borderRadius: '50%',
+                    backgroundColor: 'var(--accent)',
+                    animation: `pulse 1.2s ease-in-out ${i * 0.2}s infinite`,
+                  }}
+                />
+              ))}
+            </div>
+          )}
+
+          {!isLoading && files.length === 0 && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '200px', color: 'var(--text-muted)', fontSize: '13px' }}>
+              暂无素材
+            </div>
+          )}
+
+          <div ref={sentinelRef} style={sentinelStyle} />
+
+          {!isLoading && files.length > 0 && !hasMore && (
+            <div style={footerTextStyle}>已显示全部 {totalCount} 项</div>
+          )}
+        </div>
+      </div>
+
       {canvasAttachmentPreview ? (
-        <div style={previewWrapperStyle}>
+        <div style={{ ...previewWrapperStyle, ...previewLayerStyle }}>
           <div data-tauri-drag-region style={previewTopBarStyle}>
             <button onClick={handleBackFromAttachmentPreview} className="no-drag" style={previewBackBtnStyle}>
               <Icon name="arrow_back" size={18} style={previewBackIconStyle} />
@@ -2192,9 +2431,11 @@ export const Canvas: React.FC<CanvasProps> = () => {
 
             <span style={previewFilenameStyle}>{activeCanvasAttachmentItem?.filename ?? '附件内容'}</span>
 
-            <div className="no-drag" style={previewWindowCtrlsStyle}>
-              <WindowControls topOffset={0} rightOffset={0} />
-            </div>
+            {!isMacUi && (
+              <div className="no-drag" style={previewWindowCtrlsStyle}>
+                <WindowControls topOffset={0} rightOffset={0} />
+              </div>
+            )}
           </div>
 
           <div
@@ -2289,7 +2530,7 @@ export const Canvas: React.FC<CanvasProps> = () => {
           </div>
         </div>
       ) : viewMode === 'preview' && files[previewIndex] ? (
-        <div style={previewWrapperStyle}>
+        <div style={{ ...previewWrapperStyle, ...previewLayerStyle }}>
           {/* 顶部栏 */}
           <div data-tauri-drag-region style={previewTopBarStyle}>
             <button onClick={handleBackToGrid} className="no-drag" style={previewBackBtnStyle}>
@@ -2299,9 +2540,11 @@ export const Canvas: React.FC<CanvasProps> = () => {
 
             <span style={previewFilenameStyle}>{files[previewIndex].filename}</span>
 
-            <div className="no-drag" style={previewWindowCtrlsStyle}>
-              <WindowControls topOffset={0} rightOffset={0} />
-            </div>
+            {!isMacUi && (
+              <div className="no-drag" style={previewWindowCtrlsStyle}>
+                <WindowControls topOffset={0} rightOffset={0} />
+              </div>
+            )}
           </div>
 
           <div
@@ -2330,12 +2573,19 @@ export const Canvas: React.FC<CanvasProps> = () => {
             onMouseLeave={() => setIsPreviewDragging(false)}
             onDoubleClick={() => { setScale(1); setOffset({ x: 0, y: 0 }); }}
           >
-            <img
-              src={previewResolvedSrc}
-              alt={files[previewIndex].filename}
-              draggable={false}
-              style={previewImgStyle}
-            />
+            {previewResolvedSrc ? (
+              <img
+                key={currentPreviewFileId ?? 'preview'}
+                src={previewResolvedSrc}
+                alt={files[previewIndex].filename}
+                decoding="async"
+                draggable={false}
+                onError={handleMainPreviewImageError}
+                style={previewImgStyle}
+              />
+            ) : (
+              <div style={{ width: '100%', height: '100%', minHeight: 120, background: 'var(--bg-hover)' }} />
+            )}
 
             {/* 缩放比例指示器 */}
             {scale !== 1 && (
@@ -2368,109 +2618,7 @@ export const Canvas: React.FC<CanvasProps> = () => {
             </button>
           </div>
         </div>
-      ) : (
-        /* 内容区（网格/瀑布流模式） */
-        <div style={gridWrapperStyle}>
-          <TopToolbar
-            count={totalCount}
-            searchQuery={searchQuery}
-            onSearchQueryChange={setSearchQuery}
-          />
-
-          {/* 独立滚动区域 */}
-          <div
-            ref={contentRef}
-            className="canvas-content"
-            style={contentScrollStyle}
-            onClick={handleBackgroundClick}
-          >
-            {/* 空状态 */}
-            {isEmpty && (
-              <div style={emptyStateStyle}>
-                <Icon name={isTrash ? 'delete_sweep' : 'folder_open'} size={42} style={emptyIconStyle} />
-                <p style={emptyTextStyle}>{isEmptyStateText}</p>
-              </div>
-            )}
-
-            {/* Masonry 瀑布流布局 - JS 绝对定位算法，彻底消除空位 */}
-            {!isEmpty && (
-              <div style={masonryContainerStyle}>
-                {renderCards.map(({ file, pos }, index) => {
-                  const wrapperStyle: React.CSSProperties = {
-                    position: 'absolute',
-                    left: pos.x,
-                    top: pos.y,
-                    width: pos.width,
-                    height: pos.height,
-                    contain: 'layout paint style',
-                  };
-
-                  if (USE_VIRTUAL) {
-                    const isFarFromViewport = viewportHeight > 0
-                      ? Math.abs((pos.y + pos.height / 2) - (scrollTop + viewportHeight / 2)) > viewportHeight * 1.25
-                      : false;
-                    if (isFarFromViewport) {
-                      wrapperStyle.opacity = 0.999;
-                      wrapperStyle.contentVisibility = 'auto';
-                      wrapperStyle.containIntrinsicSize = `${pos.width}px ${pos.height}px`;
-                    }
-                  }
-
-                  return (
-                    <div
-                      key={file.id}
-                      style={wrapperStyle}
-                    >
-                      {/* 修复：[P2] data-card-id 只保留在 MediaCard 内层，
-                          避免 querySelectorAll 扫到 2N 个节点（wrapper + card 各一个） */}
-                      <MediaCard
-                        file={file}
-                        isInitiallyVisible={!USE_VIRTUAL ? true : index < EAGER_CARD_COUNT}
-                        onDragStart={handleCardDragStart}
-                        onDragEnd={handleCardDragEnd}
-                        onDoubleClick={handleDoubleClick}
-                        observe={observeElement}
-                        unobserve={unobserveElement}
-                      />
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {/* 加载更多指示器（绝对布局容器外单独放置） */}
-            {shouldShowLoadMoreDots && (
-              <div style={loadingDotsWrapperStyle}>
-                {[0, 1, 2].map(i => (
-                  <div
-                    key={i}
-                    style={{
-                      width: '8px', height: '8px', borderRadius: '50%',
-                      backgroundColor: 'var(--accent)',
-                      animation: `pulse 1.2s ease-in-out ${i * 0.2}s infinite`,
-                    }}
-                  />
-                ))}
-              </div>
-            )}
-
-            {/* 空状态：无内容且非加载中 */}
-            {!isLoading && files.length === 0 && (
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '200px', color: 'var(--text-muted)', fontSize: '13px' }}>
-                暂无素材
-              </div>
-            )}
-
-            {/* IntersectionObserver 哨兵 */}
-            <div ref={sentinelRef} style={sentinelStyle} />
-
-            {/* 全部加载完成提示 */}
-            {!isLoading && files.length > 0 && !hasMore && (
-              <div style={footerTextStyle}>已显示全部 {totalCount} 项</div>
-            )}
-          </div>
-        </div>
-      )}
+      ) : null}
 
       {/* 右键菜单 */}
       <ContextMenu onAction={handleContextMenuAction} isTrash={isTrash} />

@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — Sidebar 导航栏
+ * Gega Gallery — Sidebar 导航栏
  *
  * 简洁扁平结构：4 个主导航项 + 底部 2 个功能按钮
  * 布局：顶部 Logo 固定，中间导航 flex:1，底部按钮区固定
@@ -13,6 +13,8 @@ import { useUiStore } from '../../stores/uiStore';
 import { useMediaStore } from '../../stores/mediaStore';
 import { GegaLogo } from '../common/GegaLogo';
 import { Icon } from '../common/Icon';
+import { detectUiPlatform } from '../../lib/platform';
+import { WindowControls } from '../common/WindowControls';
 
 // Tweaks 色板是用户可选的品牌色配置值，不是组件样式色。
 const ACCENT_SWATCHES = [
@@ -141,6 +143,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
   const setColumnCount = useUiStore((s) => s.setColumnCount);
   const metaMode = useUiStore((s) => s.metaMode);
   const setMetaMode = useUiStore((s) => s.setMetaMode);
+  const isMacUi = detectUiPlatform() === 'macos';
 
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [isAddingGroup, setIsAddingGroup] = useState(false);
@@ -275,6 +278,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
     }
 
     try {
+      const isAiNav = activeNav === 'ai-prompts';
       const counts = await invoke<GroupItemCount[]>('get_group_item_counts', {
         filter: {
           tagIds: null,
@@ -282,12 +286,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
           categoryName: null,
           onlyTrashed: activeNav === 'trash',
           fileTypes: null,
-          hasAiMetadata: activeNav === 'ai-prompts',
-          sourceFolder: (activeNav === 'trash' || activeNav === 'ai-prompts')
-            ? null
-            : (sourceFolder ?? null),
+          hasAiMetadata: false,
+          aiMetadataStatus: null,
+          sourceFolder: isAiNav || activeNav === 'trash' ? null : (sourceFolder ?? null),
           libraryRootPath: null,
           keyword: null,
+          virtualAiPromptsView: isAiNav,
         },
         groupNames: customGroups,
       });
@@ -578,44 +582,67 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
         fontFamily: 'var(--font-family)',
       }}
     >
-      {/* Logo 区域 */}
+      {/* Logo 区域（macOS：左侧红绿灯 + 标题） */}
       <div
         data-tauri-drag-region
         style={{
           height: '48px',
-          padding: '0 16px',
+          padding: '0 12px 0 0',
           display: 'flex',
           alignItems: 'center',
           gap: '10px',
           borderBottom: '1px solid var(--border)',
           flexShrink: 0,
+          position: 'relative',
         }}
       >
-        <GegaLogo width={22} height={22} />
-        <span style={{
-          fontFamily: 'var(--font-family)',
-          fontSize: '15px',
-          fontWeight: 700,
-          color: 'var(--accent)',
-          letterSpacing: '-0.02em',
-        }}>
-          Gega
-        </span>
+        {isMacUi && (
+          <WindowControls topOffset={0} leftOffset={0} />
+        )}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '10px',
+            flex: 1,
+            minWidth: 0,
+            paddingLeft: isMacUi ? '72px' : '16px',
+          }}
+        >
+          <GegaLogo width={22} height={22} />
+          <span style={{
+            fontFamily: 'var(--font-family)',
+            fontSize: '15px',
+            fontWeight: 700,
+            color: 'var(--accent)',
+            letterSpacing: '-0.02em',
+          }}>
+            Gega
+          </span>
+        </div>
       </div>
 
-      {/* 主导航区 - 扁平列表，无子菜单 */}
-      <nav
+      {/* 中部：主导航固定 + 自定义分组独立滚动（AGENTS §3.3 三段式） */}
+      <div
         style={{
           flex: 1,
           minHeight: 0,
-          padding: '12px 10px 8px',
           display: 'flex',
           flexDirection: 'column',
-          gap: '12px',
+          overflow: 'hidden',
           WebkitAppRegion: 'no-drag',
         } as React.CSSProperties & { WebkitAppRegion?: string }}
       >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '1px', flexShrink: 0 }}>
+        <nav
+          style={{
+            flexShrink: 0,
+            padding: '12px 10px 4px',
+            display: 'flex',
+            flexDirection: 'column',
+            WebkitAppRegion: 'no-drag',
+          } as React.CSSProperties & { WebkitAppRegion?: string }}
+        >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1px' }}>
           {NAV_ITEMS.map((item) => {
             const isActive = activeNav === item.id && !hasActiveCustomGroup;
             const isDragOver = dragOverId === item.id;
@@ -704,11 +731,11 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
             );
           })}
         </div>
+        </nav>
 
-        {/* ── 分组区域：紧接在导航按钮之后，仅灵感库 / AI提示词库 / 作品集管理 ── */}
+        {/* ── 自定义分组：独立滚动区 ── */}
         {supportsGroups && (
-          <div style={{ minHeight: 0, display: 'flex', flexDirection: 'column', flex: 1, WebkitAppRegion: 'no-drag' } as React.CSSProperties & { WebkitAppRegion?: string }}>
-            {/* 分割线 */}
+          <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', padding: '0 10px 8px', WebkitAppRegion: 'no-drag' } as React.CSSProperties & { WebkitAppRegion?: string }}>
             <div style={{ height: '1px', backgroundColor: 'var(--border)', margin: '0 6px 10px', flexShrink: 0 }} />
 
             {/* 分组标题（原型 nav-section-title 风格） */}
@@ -882,7 +909,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
             </div>
           </div>
         )}
-      </nav>
+      </div>
 
       {/* 底部区域 */}
       <div

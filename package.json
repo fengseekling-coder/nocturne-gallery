@@ -1,8 +1,8 @@
 {
   "name": "nocturne-gallery",
   "version": "0.1.0",
-  "description": "本地桌面端素材管理软件 — 为设计师和创意工作者打造",
-  "private": false,
+  "description": "Gega Gallery — 本地桌面端素材管理软件",
+  "private": true,
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -15,10 +15,12 @@
     "preview": "vite preview",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "lint": "eslint src",
+    "lint": "eslint .",
     "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test",
     "perf:test": "node scripts/performance-test.js",
-    "perf:report": "echo 'Performance report generation coming soon'"
+    "perf:report": "node scripts/performance-report.js",
+    "audit:commands": "node scripts/audit-tauri-commands.js"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
@@ -43,7 +45,6 @@
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.0",
     "autoprefixer": "^10.4.0",
-    "better-sqlite3": "^12.8.0",
     "eslint": "^10.4.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",

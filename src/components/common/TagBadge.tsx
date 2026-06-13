@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — TagBadge
+ * Gega Gallery — TagBadge
  *
  * 标签徽章组件。
  * 背景：tag.color 15% opacity（color-mix）。

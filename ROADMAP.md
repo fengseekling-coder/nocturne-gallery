@@ -1,6 +1,6 @@
 # Roadmap
 
-Nocturne Gallery is in an early public release. This roadmap tracks maintainer priorities and helps contributors understand where focused work is useful.
+Gega Gallery is in an early public release. This roadmap tracks maintainer priorities and helps contributors understand where focused work is useful.
 
 ## 0.1.x: Public Repository Readiness
 

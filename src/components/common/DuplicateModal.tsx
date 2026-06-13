@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — DuplicateModal
+ * Gega Gallery — DuplicateModal
  *
  * 导入重复素材时的居中确认弹窗：
  * - 展示准备导入素材与库中已有素材

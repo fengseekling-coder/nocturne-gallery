@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — ContextMenu
+ * Gega Gallery — ContextMenu
  *
  * 右键上下文菜单，根据当前视图（回收站 / 普通）动态生成菜单项。
  * 非回收站：查看大图、在文件夹中显示、复制路径、另存为、移入回收站、永久删除

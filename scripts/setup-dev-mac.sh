@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Nocturne Gallery — 新 Mac 开发环境检查与项目依赖安装
+# Gega Gallery — 新 Mac 开发环境检查与项目依赖安装
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-echo "==> Nocturne Gallery 环境检查"
+echo "==> Gega Gallery 环境检查"
 echo "    项目目录: $ROOT"
 echo ""
 

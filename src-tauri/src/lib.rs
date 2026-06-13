@@ -1,15 +1,15 @@
+mod commands;
 pub mod db;
 pub mod media;
 pub mod models;
-mod commands;
 
 use commands::*;
 use media::thumbnail_queue::ThumbnailQueue;
 use media::watcher::LibraryWatcher;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 fn log_startup(is_dev: bool, message: &str) {
     if !is_dev {
@@ -34,10 +34,10 @@ pub struct AppState {
     pub background_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// æ£€æŸ¥å¹¶é‡æ–°ç”Ÿæˆç¼ºå¤±çš„ç¼©ç•¥å›¾
+/// 初始化 Tauri 应用并启动缩略图队列、库监听和后台维护任务。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // åˆ›å»ºç¼©ç•¥å›¾é˜Ÿåˆ—
+    // 创建缩略图队列
     let thumbnail_queue = Arc::new(ThumbnailQueue::new());
     let startup_backfill_shutdown = Arc::new(AtomicBool::new(false));
     let manual_micro_backfill_shutdown = Arc::new(AtomicBool::new(false));
@@ -62,17 +62,32 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
             let is_dev = cfg!(debug_assertions);
+            thumbnail_queue.start_processor(app_handle.clone());
             if is_dev {
-                log_startup(true, "[setup] Dev mode: thumbnail queue processor will start on demand only");
-            } else {
-                thumbnail_queue.start_processor(app_handle.clone());
+                log_startup(true, "[setup] Dev mode: thumbnail queue + limited micro backfill enabled");
             }
 
-            // 从 AppData/.nocturne/config.json 读取 library_root
+            // 从 AppData/.nocturne/config.json 读取并规范化 library_root（与用户所选目录一致）
             let config_path = data_dir.join(".nocturne/config.json");
-            let library_root_opt: Option<String> = std::fs::read_to_string(&config_path).ok()
-                .and_then(|c| serde_json::from_str::<media::watcher::LibraryConfig>(&c).ok())
-                .map(|c| c.root_path);
+            let library_root_opt: Option<String> =
+                media::watcher::configured_library_root_from_app_data(&data_dir);
+            if let Some(ref root) = library_root_opt {
+                if let Ok(content) = std::fs::read_to_string(&config_path) {
+                    if let Ok(config) =
+                        serde_json::from_str::<media::watcher::LibraryConfig>(&content)
+                    {
+                        if config.root_path != *root {
+                            let updated = media::watcher::LibraryConfig {
+                                root_path: root.clone(),
+                                version: config.version,
+                            };
+                            if let Ok(json) = serde_json::to_string_pretty(&updated) {
+                                let _ = std::fs::write(&config_path, json);
+                            }
+                        }
+                    }
+                }
+            }
 
             // 计算 db_path：有库配置时用 {library_root}/.nocturne/nocturne.db，否则回落 AppData
             let db_path = if let Some(ref root) = library_root_opt {
@@ -119,7 +134,63 @@ pub fn run() {
                         log::warn!("[setup] Failed to allow library root in asset scope: {}", e);
                     }
 
-                    match LibraryWatcher::new(root_path, &db_path) {
+                    if let Ok(mut conn) = db::open_conn(&db_path) {
+                        if let Ok(n) = db::crud::repair_unix_path_separators_in_media_paths(&conn) {
+                            if n > 0 {
+                                log_startup(
+                                    is_dev,
+                                    &format!("[setup] Fixed {} path fields (backslash → slash)", n),
+                                );
+                            }
+                        }
+                        match db::crud::update_library_root_prefixes(&mut conn, root_path) {
+                            Ok(n) if n > 0 => {
+                                log_startup(
+                                    is_dev,
+                                    &format!("[setup] Repaired {} stale path fields in DB", n),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => log::warn!("[setup] Library path rebase failed: {}", e),
+                        }
+                        if let Ok(n) =
+                            crate::media::path_util::relink_media_filepaths_in_db(&conn, root_path)
+                        {
+                            if n > 0 {
+                                log_startup(
+                                    is_dev,
+                                    &format!("[setup] Relinked {} media paths to files on disk", n),
+                                );
+                            }
+                        }
+                        match crate::media::trash_reconcile::reconcile_trashed_media_with_disk(
+                            &conn,
+                            root_path,
+                        ) {
+                            Ok(rep) if rep.moved_to_trash_dir > 0
+                                || rep.db_path_updated > 0
+                                || rep.orphaned_trash_records > 0
+                                || rep.failed > 0 =>
+                            {
+                                log_startup(
+                                    is_dev,
+                                    &format!(
+                                        "[setup] Trash reconcile: scanned={} ok={} moved={} path_fix={} orphaned={} failed={}",
+                                        rep.scanned,
+                                        rep.already_ok,
+                                        rep.moved_to_trash_dir,
+                                        rep.db_path_updated,
+                                        rep.orphaned_trash_records,
+                                        rep.failed
+                                    ),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => log::warn!("[setup] Trash reconcile failed: {}", e),
+                        }
+                    }
+
+                    match LibraryWatcher::new(root_path, &db_path, app_handle.clone()) {
                         Ok(watcher) => {
                             let state = app_handle.state::<AppState>();
                             let mut guard = state.library_watcher.lock().unwrap_or_else(|e| {
@@ -136,12 +207,6 @@ pub fn run() {
                     let root_clone = root_path.clone();
                     let startup_backfill_shutdown = Arc::clone(&startup_backfill_shutdown_clone);
                     let handle = std::thread::spawn(move || {
-                        if is_dev {
-                            log_startup(true, "[setup] Dev mode: startup heavy tasks disabled");
-                            log_startup(true, "[setup] Background initialization thread completed");
-                            return;
-                        }
-
                         std::thread::sleep(std::time::Duration::from_secs(1));
 
                         let count = db::open_conn(&db_path_clone)
@@ -151,36 +216,92 @@ pub fn run() {
                                     "SELECT COUNT(*) FROM media_files",
                                     [],
                                     |r| r.get::<_, i64>(0),
-                                ).ok()
+                                )
+                                .ok()
                             })
                             .unwrap_or(0);
 
                         if count == 0 {
                             log_startup_error("[setup] Empty database detected, auto-scanning library...");
                             match media::scanner::scan_directory(&root_clone, &db_path_clone, "") {
-                                Ok(r) => log_startup_error(&format!(
-                                    "[setup] Auto-scan completed: scanned={}, imported={}",
-                                    r.scanned_count, r.imported_count
-                                )),
+                                Ok(r) => {
+                                    log_startup_error(&format!(
+                                        "[setup] Auto-scan completed: scanned={}, imported={}",
+                                        r.scanned_count, r.imported_count
+                                    ));
+                                    if r.imported_count > 0 {
+                                        let _ = app_handle.emit(
+                                            "library_files_imported",
+                                            serde_json::json!({ "imported": r.imported_count }),
+                                        );
+                                    }
+                                }
                                 Err(e) => log_startup_error(&format!("[setup] Auto-scan failed: {}", e)),
+                            }
+                        } else {
+                            match media::library_sync::sync_library_from_disk(
+                                &root_clone,
+                                &db_path_clone,
+                            ) {
+                                Ok(r) => {
+                                    log_startup(is_dev, &format!(
+                                        "[setup] Startup disk sync: scanned={}, imported={}, skipped={}",
+                                        r.scanned_count, r.imported_count, r.skipped_count
+                                    ));
+                                    if r.imported_count > 0 {
+                                        let _ = app_handle.emit(
+                                            "library_files_imported",
+                                            serde_json::json!({ "imported": r.imported_count }),
+                                        );
+                                    }
+                                }
+                                Err(e) => log::warn!("[setup] Startup disk sync failed: {}", e),
                             }
                         }
 
                         let db_for_backfill = db_path_clone.clone();
                         let app_handle_for_backfill = app_handle.clone();
+                        let backfill_delay = if is_dev { 2 } else { 5 };
+                        let backfill_max = if is_dev { Some(800) } else { Some(5000) };
+                        let shutdown_micro = Arc::clone(&startup_backfill_shutdown);
+                        let shutdown_design = Arc::clone(&startup_backfill_shutdown);
+                        let app_micro = app_handle_for_backfill.clone();
+                        let app_design = app_handle_for_backfill.clone();
+                        let db_micro = db_for_backfill.clone();
+                        let db_design = db_for_backfill.clone();
                         tauri::async_runtime::spawn(async move {
                             if let Err(e) = commands::run_micro_backfill(
-                                &app_handle_for_backfill,
-                                &db_for_backfill,
-                                startup_backfill_shutdown,
-                                5,
-                                Some(5000),
+                                &app_micro,
+                                &db_micro,
+                                shutdown_micro,
+                                backfill_delay,
+                                backfill_max,
                                 None,
                                 None,
-                            ).await {
+                            )
+                            .await
+                            {
                                 log::warn!("[startup_backfill] failed: {}", e);
                             }
                         });
+                        let design_delay = backfill_delay.saturating_add(3);
+                        let design_max = if is_dev { Some(80) } else { Some(200) };
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = commands::run_design_source_backfill(
+                                &app_design,
+                                &db_design,
+                                shutdown_design,
+                                design_delay,
+                                design_max,
+                            )
+                            .await
+                            {
+                                log::warn!("[design_backfill] failed: {}", e);
+                            }
+                        });
+                        if is_dev {
+                            log_startup(true, "[setup] Dev mode: micro + design source backfill scheduled");
+                        }
 
                         log_startup_error("[setup] Background thumbnail backfill scheduled");
                         log_startup_error("[setup] Background initialization thread completed");
@@ -193,6 +314,11 @@ pub fn run() {
                 }
             } else {
                 eprintln!("[setup] No library root configured, showing setup UI");
+            }
+
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
             }
 
             Ok(())
@@ -222,6 +348,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_directory,
             scan_library,
+            sync_library_from_disk,
             rescan_library,
             get_media_files,
             get_media_detail,
@@ -240,8 +367,11 @@ pub fn run() {
             batch_move_to_trash,
             restore_from_trash,
             batch_restore_from_trash,
+            reconcile_trash_with_disk,
+            get_trash_diagnostics,
             empty_trash,
             init_library,
+            get_native_platform,
             get_library_root,
             set_library_root,
             clear_all_media,
@@ -278,11 +408,13 @@ pub fn run() {
             get_file_info,
             replace_file,
             check_ffmpeg_available,            // v5.8: Multi-tier thumbnail commands
+            ensure_media_preview_thumbnails,
             generate_preview_thumbnail_for_item,
             count_missing_thumbnails,
             rebuild_missing_thumbnails,
             cancel_rebuild_thumbnails,
             repair_missing_dimensions,
+            probe_image_dimensions,
             update_media_dimensions,
             start_file_drag,
             show_in_folder,
@@ -304,5 +436,8 @@ pub fn run() {
             commands::ai_tools::openai_generate_image,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|error| {
+            eprintln!("Gega Gallery 启动失败：{}", error);
+            std::process::exit(1);
+        });
 }

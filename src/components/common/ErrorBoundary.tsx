@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — ErrorBoundary
+ * Gega Gallery — ErrorBoundary
  *
  * 全局错误边界，防止单个组件崩溃导致整个应用黑屏。
  * 捕获子组件渲染时的运行时错误，显示友好的错误提示。

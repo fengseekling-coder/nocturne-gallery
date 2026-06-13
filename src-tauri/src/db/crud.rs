@@ -3,7 +3,38 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use uuid::Uuid;
 
-use crate::models::{AiMetadata, GroupItemCount, MediaAttachment, MediaDetail, MediaFile, NavItemCount, MediaFilter, Tag, ItemSummary, ItemDetail, ReversePromptData, LibraryStats, TagCount};
+use crate::models::{
+    AiMetadata, GroupItemCount, ItemDetail, ItemSummary, LibraryStats, MediaAttachment,
+    MediaDetail, MediaFile, MediaFilter, NavItemCount, ReversePromptData, Tag, TagCount,
+};
+
+type ItemDetailRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<i32>,
+    Option<i32>,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+);
+
+type ReversePromptRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+);
 
 // ─────────────────────────────────────────────
 //  统计相关结构体
@@ -18,6 +49,25 @@ pub struct MediaStatistics {
 // ─────────────────────────────────────────────
 //  内部工具：从行映射 MediaFile
 // ─────────────────────────────────────────────
+
+fn path_on_disk(path: &Option<String>) -> Option<String> {
+    let trimmed = path.as_deref()?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if std::path::Path::new(trimmed).is_file() {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// 列表/详情返回前：去掉 DB 里指向已删除文件的缩略图路径，避免前端反复加载 404 占位图。
+pub fn sanitize_media_file_thumbnail_paths(file: &mut MediaFile) {
+    file.thumbnail_path = path_on_disk(&file.thumbnail_path);
+    file.thumbnail_micro_path = path_on_disk(&file.thumbnail_micro_path);
+    file.thumbnail_preview_path = path_on_disk(&file.thumbnail_preview_path);
+}
 
 fn row_to_media_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaFile> {
     let is_trashed_int: i32 = row.get(13)?;
@@ -121,6 +171,37 @@ fn media_search_index_exists(conn: &Connection) -> bool {
     .unwrap_or(false)
 }
 
+/// 与列表查询一致的关键字条件（FTS 或 LIKE 回退），`id_column` 如 `id` 或 `mf.id`。
+fn push_keyword_filter(
+    conn: &Connection,
+    conditions: &mut Vec<String>,
+    param_values: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    id_column: &str,
+    keyword: &str,
+) {
+    let Some(match_query) = build_fts_match_query(keyword) else {
+        return;
+    };
+    if media_search_index_exists(conn) {
+        conditions.push(format!(
+            "{id_column} IN (SELECT media_id FROM media_search_fts WHERE media_search_fts MATCH ?)",
+            id_column = id_column
+        ));
+        param_values.push(Box::new(match_query));
+    } else {
+        let like_keyword = format!("%{}%", keyword.trim());
+        conditions.push(format!(
+            "({id_column} IN (SELECT id FROM media_files WHERE filename LIKE ?) \
+             OR {id_column} IN (SELECT media_id FROM media_tags mt JOIN tags t ON mt.tag_id = t.id WHERE t.name LIKE ?) \
+             OR {id_column} IN (SELECT media_id FROM ai_metadata WHERE prompt_text LIKE ?))",
+            id_column = id_column
+        ));
+        param_values.push(Box::new(like_keyword.clone()));
+        param_values.push(Box::new(like_keyword.clone()));
+        param_values.push(Box::new(like_keyword));
+    }
+}
+
 fn build_fts_match_query(keyword: &str) -> Option<String> {
     let terms: Vec<String> = keyword
         .split_whitespace()
@@ -213,7 +294,9 @@ pub fn ensure_media_search_index(conn: &Connection) -> Result<()> {
         .query_row("SELECT COUNT(*) FROM media_files", [], |row| row.get(0))
         .context("Failed to count media_files for media_search_fts")?;
     let indexed_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM media_search_fts", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM media_search_fts", [], |row| {
+            row.get(0)
+        })
         .context("Failed to count media_search_fts rows")?;
 
     if indexed_count != media_count {
@@ -227,6 +310,91 @@ pub fn ensure_media_search_index(conn: &Connection) -> Result<()> {
 //  查询（带过滤器和分页）
 // ─────────────────────────────────────────────
 
+/// 列表与分组计数共用的 WHERE 条件（`table_prefix` 为空表示 `media_files` 裸列名；`mf.` 用于 JOIN 查询）。
+fn push_media_list_filter_conditions(
+    conn: &Connection,
+    conditions: &mut Vec<String>,
+    param_values: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    filter: &MediaFilter,
+    table_prefix: &str,
+) {
+    let id_col = format!("{table_prefix}id");
+    let filepath_col = format!("{table_prefix}filepath");
+    let is_trashed_col = format!("{table_prefix}is_trashed");
+    let filetype_col = format!("{table_prefix}filetype");
+    let source_folder_col = format!("{table_prefix}source_folder");
+    let category_id_col = format!("{table_prefix}category_id");
+
+    if let Some(ref root) = filter.library_root_path {
+        push_library_root_filter(conditions, param_values, &filepath_col, root);
+    }
+
+    conditions.push(format!("{is_trashed_col} = ?"));
+    param_values.push(Box::new(if filter.only_trashed { 1i32 } else { 0i32 }));
+
+    if let Some(ref types) = filter.file_types {
+        if !types.is_empty() {
+            let placeholders = types.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            conditions.push(format!("{filetype_col} IN ({placeholders})"));
+            for t in types {
+                param_values.push(Box::new(t.clone()));
+            }
+        }
+    }
+
+    if let Some(ref tag_ids) = filter.tag_ids {
+        if !tag_ids.is_empty() {
+            let placeholders = tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            conditions.push(format!(
+                "{id_col} IN (SELECT media_id FROM media_tags WHERE tag_id IN ({placeholders}) GROUP BY media_id HAVING COUNT(DISTINCT tag_id) = {})",
+                tag_ids.len()
+            ));
+            for tid in tag_ids {
+                param_values.push(Box::new(tid.clone()));
+            }
+        }
+    }
+
+    if let Some(ref category_name) = filter.category_name {
+        if !category_name.is_empty() {
+            conditions.push(format!(
+                "{category_id_col} IN (SELECT id FROM categories WHERE name = ?)"
+            ));
+            param_values.push(Box::new(category_name.clone()));
+        }
+    }
+
+    if filter.virtual_ai_prompts_view {
+        if filter.ai_metadata_status.is_none() && !filter.has_ai_metadata {
+            conditions.push(format!(
+                "{id_col} IN (SELECT media_id FROM ai_metadata WHERE prompt_text IS NOT NULL AND TRIM(prompt_text) != '')"
+            ));
+        }
+    } else if let Some(ref source) = filter.source_folder {
+        if !source.is_empty() {
+            conditions.push(format!("{source_folder_col} = ?"));
+            param_values.push(Box::new(source.clone()));
+        }
+    }
+
+    match filter.ai_metadata_status.as_deref() {
+        Some("filled") => conditions.push(format!(
+            "{id_col} IN (SELECT media_id FROM ai_metadata WHERE prompt_text IS NOT NULL AND TRIM(prompt_text) != '')"
+        )),
+        Some("empty") => conditions.push(format!(
+            "{id_col} NOT IN (SELECT media_id FROM ai_metadata WHERE prompt_text IS NOT NULL AND TRIM(prompt_text) != '')"
+        )),
+        _ if filter.has_ai_metadata => conditions.push(format!(
+            "{id_col} IN (SELECT media_id FROM ai_metadata WHERE prompt_text IS NOT NULL AND TRIM(prompt_text) != '')"
+        )),
+        _ => {}
+    }
+
+    if let Some(ref keyword) = filter.keyword {
+        push_keyword_filter(conn, conditions, param_values, &id_col, keyword);
+    }
+}
+
 /// 返回 (items, total_count, next_cursor)。page 从 1 开始。
 /// 当 cursor 存在时走 keyset 分页（无 OFFSET），total 返回 -1 表示"沿用上次"。
 /// library_root_path 从 filter 中读取，用于过滤只显示库根目录范围内的文件
@@ -238,97 +406,10 @@ pub fn query_media_files(
     cursor: Option<&crate::models::MediaCursor>,
     skip_count: bool,
 ) -> Result<(Vec<MediaFile>, i64, Option<crate::models::MediaCursor>)> {
-    // 动态构建 WHERE 子句
     let mut conditions: Vec<String> = Vec::new();
-    // 使用 Box<dyn rusqlite::ToSql> 存储参数
     let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
-    // 库根路径过滤（最重要的守卫）
-    if let Some(ref root) = filter.library_root_path {
-        push_library_root_filter(&mut conditions, &mut param_values, "filepath", root);
-    }
-
-    // is_trashed 过滤
-    conditions.push("is_trashed = ?".to_string());
-    param_values.push(Box::new(if filter.only_trashed { 1i32 } else { 0i32 }));
-
-    // 文件类型过滤
-    if let Some(ref types) = filter.file_types {
-        if !types.is_empty() {
-            let placeholders = types.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-            conditions.push(format!("filetype IN ({})", placeholders));
-            for t in types {
-                param_values.push(Box::new(t.clone()));
-            }
-        }
-    }
-
-    // 标签过滤（需要所有指定标签都存在）
-    if let Some(ref tag_ids) = filter.tag_ids {
-        if !tag_ids.is_empty() {
-            let placeholders = tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-            conditions.push(format!(
-                "id IN (SELECT media_id FROM media_tags WHERE tag_id IN ({}) GROUP BY media_id HAVING COUNT(DISTINCT tag_id) = {})",
-                placeholders,
-                tag_ids.len()
-            ));
-            for tid in tag_ids {
-                param_values.push(Box::new(tid.clone()));
-            }
-        }
-    }
-
-    // 自定义分组过滤（按分类名称隔离）
-    if let Some(ref category_name) = filter.category_name {
-        if !category_name.is_empty() {
-            conditions.push("category_id IN (SELECT id FROM categories WHERE name = ?)".to_string());
-            param_values.push(Box::new(category_name.clone()));
-        }
-    }
-
-    // AI 元数据状态过滤
-    match filter.ai_metadata_status.as_deref() {
-        Some("filled") => conditions.push(
-            "id IN (SELECT media_id FROM ai_metadata WHERE prompt_text IS NOT NULL AND TRIM(prompt_text) != '')".to_string(),
-        ),
-        Some("empty") => conditions.push(
-            "id NOT IN (SELECT media_id FROM ai_metadata WHERE prompt_text IS NOT NULL AND TRIM(prompt_text) != '')".to_string(),
-        ),
-        _ if filter.has_ai_metadata => conditions.push(
-            "id IN (SELECT media_id FROM ai_metadata WHERE prompt_text IS NOT NULL AND TRIM(prompt_text) != '')".to_string(),
-        ),
-        _ => {}
-    }
-
-    // 来源文件夹过滤
-    if let Some(ref source) = filter.source_folder {
-        if !source.is_empty() {
-            conditions.push("source_folder = ?".to_string());
-            param_values.push(Box::new(source.clone()));
-        }
-    }
-    
-    // 关键字搜索 (文件名, 标签, AI 提示词)
-    if let Some(ref keyword) = filter.keyword {
-        if let Some(match_query) = build_fts_match_query(keyword) {
-            if media_search_index_exists(conn) {
-                conditions.push(
-                    "id IN (SELECT media_id FROM media_search_fts WHERE media_search_fts MATCH ?)"
-                        .to_string(),
-                );
-                param_values.push(Box::new(match_query));
-            } else {
-                let like_keyword = format!("%{}%", keyword.trim());
-                conditions.push(
-                    "(filename LIKE ? OR id IN (SELECT media_id FROM media_tags mt JOIN tags t ON mt.tag_id = t.id WHERE t.name LIKE ?) OR id IN (SELECT media_id FROM ai_metadata WHERE prompt_text LIKE ?))"
-                        .to_string(),
-                );
-                param_values.push(Box::new(like_keyword.clone()));
-                param_values.push(Box::new(like_keyword.clone()));
-                param_values.push(Box::new(like_keyword));
-            }
-        }
-    }
+    push_media_list_filter_conditions(conn, &mut conditions, &mut param_values, filter, "");
 
     // Keyset 分页条件
     if let Some(c) = cursor {
@@ -356,8 +437,7 @@ pub fn query_media_files(
     );
 
     // 将参数转为引用切片以供 rusqlite 使用
-    let params_refs: Vec<&dyn rusqlite::ToSql> =
-        param_values.iter().map(|b| b.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
 
     // 后续页可跳过 COUNT，前端沿用已有 totalCount。
     let count_sql = format!("SELECT COUNT(*) FROM media_files {}", where_clause);
@@ -373,12 +453,18 @@ pub fn query_media_files(
     let limit_box: Box<dyn rusqlite::ToSql> = Box::new(per_page);
     select_params.push(limit_box.as_ref());
 
-    let mut stmt = conn.prepare(&select_sql).context("Failed to prepare select statement")?;
-    let items = stmt
+    let mut stmt = conn
+        .prepare(&select_sql)
+        .context("Failed to prepare select statement")?;
+    let mut items = stmt
         .query_map(select_params.as_slice(), row_to_media_file)
         .context("Failed to query media_files")?
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("Failed to collect media_files")?;
+
+    for file in &mut items {
+        sanitize_media_file_thumbnail_paths(file);
+    }
 
     // 构造 next_cursor
     let next_cursor = if items.len() == per_page as usize {
@@ -397,25 +483,37 @@ pub fn query_media_files(
 //  查询单个文件详情
 // ─────────────────────────────────────────────
 
-pub fn get_media_detail(conn: &Connection, id: &str) -> Result<Option<MediaDetail>> {
-    // 查询文件基本信息
+pub fn get_media_detail(
+    conn: &Connection,
+    id: &str,
+    library_root_path: Option<&str>,
+) -> Result<Option<MediaDetail>> {
+    let mut conditions = vec!["id = ?".to_string()];
+    let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(id.to_string())];
+    if let Some(root) = library_root_path.filter(|r| !r.trim().is_empty()) {
+        push_library_root_filter(&mut conditions, &mut param_values, "filepath", root);
+    }
+    let where_clause = conditions.join(" AND ");
+    let sql = format!(
+        "SELECT id, filename, filepath, filetype, mime_type, width, height, \
+         file_size, created_at, modified_at, imported_at, thumbnail_path, \
+         color_dominant, is_trashed, source_folder, sha256, phash, \
+         thumbnail_micro_path, thumbnail_preview_path, thumbhash \
+         FROM media_files WHERE {}",
+        where_clause
+    );
+    let params_refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|v| v.as_ref()).collect();
+
     let file_opt: Option<MediaFile> = conn
-        .query_row(
-            "SELECT id, filename, filepath, filetype, mime_type, width, height, \
-             file_size, created_at, modified_at, imported_at, thumbnail_path, \
-             color_dominant, is_trashed, source_folder, sha256, phash, \
-             thumbnail_micro_path, thumbnail_preview_path, thumbhash \
-             FROM media_files WHERE id = ?",
-            params![id],
-            row_to_media_file,
-        )
+        .query_row(&sql, params_refs.as_slice(), row_to_media_file)
         .optional()
         .context("Failed to query media file by id")?;
 
-    let file = match file_opt {
+    let mut file = match file_opt {
         None => return Ok(None),
         Some(f) => f,
     };
+    sanitize_media_file_thumbnail_paths(&mut file);
 
     // 查询关联标签
     let mut tag_stmt = conn.prepare(
@@ -562,7 +660,7 @@ pub fn insert_media_file(conn: &Connection, file: &MediaFile) -> Result<bool> {
 /// 则自动恢复（is_trashed=1→0）并更新元数据。已经是正常状态的才返回 false（跳過）。
 pub fn insert_or_restore_media_file(conn: &Connection, file: &MediaFile) -> Result<bool> {
     match insert_media_file(conn, file) {
-        Ok(true) => Ok(true),  // 新插入成功
+        Ok(true) => Ok(true), // 新插入成功
         Ok(false) => {
             // filepath 已存在，检查是否在回收站
             let restored = conn.execute(
@@ -635,15 +733,14 @@ pub fn insert_or_replace_media_file(conn: &Connection, file: &MediaFile) -> Resu
 
 /// 事务内：删除该 media 的所有旧标签关联，然后按 tag_names
 /// 查找或创建 Tag，最后批量插入新关联。
-pub fn update_media_tags(
-    conn: &Connection,
-    media_id: &str,
-    tag_names: &[String],
-) -> Result<()> {
+pub fn update_media_tags(conn: &Connection, media_id: &str, tag_names: &[String]) -> Result<()> {
     log::info!("[db] Atomic update tags for item: {}", media_id);
     // 删除旧关联
-    conn.execute("DELETE FROM media_tags WHERE media_id = ?", params![media_id])
-        .context("Failed to delete old media_tags")?;
+    conn.execute(
+        "DELETE FROM media_tags WHERE media_id = ?",
+        params![media_id],
+    )
+    .context("Failed to delete old media_tags")?;
 
     for name in tag_names {
         let name = name.trim();
@@ -793,16 +890,19 @@ pub fn update_thumbnail_preview_path(conn: &Connection, id: &str, path: &str) ->
 
 /// 通过 ID 获取完整的 MediaFile（用于多档缩略图命令）
 pub fn get_media_file_by_id(conn: &Connection, id: &str) -> Result<MediaFile> {
-    conn.query_row(
-        "SELECT id, filename, filepath, filetype, mime_type, width, height, \
-         file_size, created_at, modified_at, imported_at, thumbnail_path, \
-         color_dominant, is_trashed, source_folder, sha256, phash, \
-         thumbnail_micro_path, thumbnail_preview_path, thumbhash \
-         FROM media_files WHERE id = ?",
-        params![id],
-        row_to_media_file,
-    )
-    .context("Failed to get media file by id")
+    let mut file = conn
+        .query_row(
+            "SELECT id, filename, filepath, filetype, mime_type, width, height, \
+             file_size, created_at, modified_at, imported_at, thumbnail_path, \
+             color_dominant, is_trashed, source_folder, sha256, phash, \
+             thumbnail_micro_path, thumbnail_preview_path, thumbhash \
+             FROM media_files WHERE id = ?",
+            params![id],
+            row_to_media_file,
+        )
+        .context("Failed to get media file by id")?;
+    sanitize_media_file_thumbnail_paths(&mut file);
+    Ok(file)
 }
 
 /// 更新媒体文件名与绝对路径，并同步刷新全文搜索索引
@@ -852,30 +952,33 @@ pub fn delete_media_file(conn: &Connection, id: &str) -> Result<()> {
 //  更新文件路径（移动文件后调用）
 // ─────────────────────────────────────────────
 
-/// 更新媒体文件的 filepath 和 source_folder
-pub fn update_media_file_path(conn: &mut Connection, id: &str, new_path: &str) -> Result<()> {
-    // 从新路径提取 source_folder（相对于库根的第一级子文件夹名）
-    let source_folder = std::path::Path::new(new_path)
-        .components()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find_map(|w| {
-            if w[0].as_os_str() == ".nocturne"
-                || w[0].as_os_str() == "媒体库"
-                || w[0].as_os_str() == "项目文件"
-                || w[0].as_os_str() == "回收站"
-            {
-                w[0].as_os_str().to_str().map(|s| s.to_string())
-            } else {
-                None
-            }
+/// 更新媒体文件的 filepath、filename 与 source_folder（库根下第一级目录名，如「灵感库」「回收站」）
+pub fn update_media_file_path(
+    conn: &mut Connection,
+    id: &str,
+    new_path: &str,
+    library_root: Option<&str>,
+) -> Result<()> {
+    let path = std::path::Path::new(new_path);
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let source_folder = library_root
+        .and_then(|root| crate::media::path_util::infer_source_folder_from_library_path(path, root))
+        .or_else(|| {
+            path.components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str())
+                .filter(|s| !s.is_empty() && *s != ".nocturne")
+                .map(|s| s.to_string())
         });
 
-    eprintln!("[update_media_file_path] Updating {} -> {}, source_folder={:?}", id, new_path, source_folder);
+    eprintln!(
+        "[update_media_file_path] Updating {} -> {}, source_folder={:?}",
+        id, new_path, source_folder
+    );
 
     conn.execute(
-        "UPDATE media_files SET filepath = ?, source_folder = ? WHERE id = ?",
-        params![new_path, source_folder, id],
+        "UPDATE media_files SET filepath = ?, filename = ?, source_folder = ? WHERE id = ?",
+        params![new_path, filename, source_folder, id],
     )
     .context("Failed to update media_file path")?;
     Ok(())
@@ -886,8 +989,9 @@ pub fn backfill_missing_dimensions_batch(
     conn: &Connection,
     batch_size: i64,
 ) -> Result<Vec<(String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, filepath
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, filepath
          FROM media_files
          WHERE filetype = 'image'
            AND (
@@ -897,8 +1001,8 @@ pub fn backfill_missing_dimensions_batch(
            )
          ORDER BY imported_at ASC, id ASC
          LIMIT ?1",
-    )
-    .context("Failed to prepare missing-dimension batch query")?;
+        )
+        .context("Failed to prepare missing-dimension batch query")?;
 
     let rows = stmt
         .query_map(params![batch_size], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -930,27 +1034,38 @@ pub fn clear_all_data(conn: &mut Connection) -> Result<i64> {
     let tx = conn.transaction().context("Failed to begin transaction")?;
 
     // 删除所有媒体标签关联
-    let media_tags_deleted = tx.execute("DELETE FROM media_tags", [])
+    let media_tags_deleted = tx
+        .execute("DELETE FROM media_tags", [])
         .context("Failed to delete media_tags")?;
     eprintln!("[clear_all_data] Deleted {} media_tags", media_tags_deleted);
 
     // 删除所有 AI 元数据
-    let ai_metadata_deleted = tx.execute("DELETE FROM ai_metadata", [])
+    let ai_metadata_deleted = tx
+        .execute("DELETE FROM ai_metadata", [])
         .context("Failed to delete ai_metadata")?;
-    eprintln!("[clear_all_data] Deleted {} ai_metadata", ai_metadata_deleted);
+    eprintln!(
+        "[clear_all_data] Deleted {} ai_metadata",
+        ai_metadata_deleted
+    );
 
     // 删除所有标签
-    let tags_deleted = tx.execute("DELETE FROM tags", [])
+    let tags_deleted = tx
+        .execute("DELETE FROM tags", [])
         .context("Failed to delete tags")?;
     eprintln!("[clear_all_data] Deleted {} tags", tags_deleted);
 
     // 删除所有媒体文件
-    let media_files_deleted = tx.execute("DELETE FROM media_files", [])
+    let media_files_deleted = tx
+        .execute("DELETE FROM media_files", [])
         .context("Failed to delete media_files")?;
-    eprintln!("[clear_all_data] Deleted {} media_files", media_files_deleted);
+    eprintln!(
+        "[clear_all_data] Deleted {} media_files",
+        media_files_deleted
+    );
 
     // 重置自增序列（media_files 用 UUID，此行通常为空操作，不报错即可）
-    tx.execute("DELETE FROM sqlite_sequence WHERE name='media_files'", []).ok();
+    tx.execute("DELETE FROM sqlite_sequence WHERE name='media_files'", [])
+        .ok();
 
     tx.commit().context("Failed to commit transaction")?;
 
@@ -958,7 +1073,10 @@ pub fn clear_all_data(conn: &mut Connection) -> Result<i64> {
     conn.execute_batch("VACUUM").ok();
     eprintln!("[clear_all_data] VACUUM completed");
 
-    eprintln!("[clear_all_data] Total cleared {} media files", media_files_deleted);
+    eprintln!(
+        "[clear_all_data] Total cleared {} media files",
+        media_files_deleted
+    );
     Ok(media_files_deleted as i64)
 }
 
@@ -967,7 +1085,13 @@ pub fn clear_all_data(conn: &mut Connection) -> Result<i64> {
 // ─────────────────────────────────────────────
 
 /// 新增书签
-pub fn insert_bookmark(conn: &Connection, url: &str, title: Option<&str>, description: Option<&str>, tags: Option<&str>) -> Result<i64> {
+pub fn insert_bookmark(
+    conn: &Connection,
+    url: &str,
+    title: Option<&str>,
+    description: Option<&str>,
+    tags: Option<&str>,
+) -> Result<i64> {
     let favicon_url = extract_favicon_url(url);
     conn.execute(
         "INSERT INTO bookmarks (url, title, description, favicon_url, tags) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -983,14 +1107,18 @@ pub fn insert_bookmark(conn: &Connection, url: &str, title: Option<&str>, descri
 /// 提取域名的 favicon URL
 fn extract_favicon_url(url: &str) -> Option<String> {
     // 从 URL 提取域名
-    let domain = url.trim_start_matches("http://")
+    let domain = url
+        .trim_start_matches("http://")
         .trim_start_matches("https://")
         .trim_start_matches("www.")
         .split('/')
         .next()?;
 
     // 使用 Google 的 favicon 服务
-    Some(format!("https://www.google.com/s2/favicons?domain={}&sz=64", domain))
+    Some(format!(
+        "https://www.google.com/s2/favicons?domain={}&sz=64",
+        domain
+    ))
 }
 
 /// 查询所有书签，按 created_at DESC
@@ -1027,7 +1155,13 @@ pub fn delete_bookmark(conn: &Connection, id: i64) -> Result<()> {
 }
 
 /// 更新书签信息
-pub fn update_bookmark(conn: &Connection, id: i64, title: Option<&str>, description: Option<&str>, tags: Option<&str>) -> Result<()> {
+pub fn update_bookmark(
+    conn: &Connection,
+    id: i64,
+    title: Option<&str>,
+    description: Option<&str>,
+    tags: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "UPDATE bookmarks SET title = ?, description = ?, tags = ? WHERE id = ?",
         params![title, description, tags, id],
@@ -1109,11 +1243,13 @@ pub fn get_media_statistics(conn: &Connection, filter: &MediaFilter) -> Result<M
         format!("WHERE {}", conditions.join(" AND "))
     };
 
-    let sql = format!("SELECT COUNT(*), SUM(file_size) FROM media_files {}", where_clause);
+    let sql = format!(
+        "SELECT COUNT(*), SUM(file_size) FROM media_files {}",
+        where_clause
+    );
 
     // 将参数转为引用切片以供 rusqlite 使用
-    let params_refs: Vec<&dyn rusqlite::ToSql> =
-        param_values.iter().map(|b| b.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
 
     let (file_count, total_size_option): (i64, Option<i64>) = conn
         .query_row(&sql, params_refs.as_slice(), |row| {
@@ -1139,64 +1275,13 @@ pub fn get_group_item_counts(
     let mut conditions: Vec<String> = Vec::new();
     let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
-    conditions.push("mf.is_trashed = ?".to_string());
-    param_values.push(Box::new(if filter.only_trashed { 1i32 } else { 0i32 }));
+    push_media_list_filter_conditions(conn, &mut conditions, &mut param_values, filter, "mf.");
 
-    if let Some(ref types) = filter.file_types {
-        if !types.is_empty() {
-            let placeholders = types.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-            conditions.push(format!("mf.filetype IN ({})", placeholders));
-            for file_type in types {
-                param_values.push(Box::new(file_type.clone()));
-            }
-        }
-    }
-
-    if let Some(ref tag_ids) = filter.tag_ids {
-        if !tag_ids.is_empty() {
-            let placeholders = tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-            conditions.push(format!(
-                "mf.id IN (SELECT media_id FROM media_tags WHERE tag_id IN ({}) GROUP BY media_id HAVING COUNT(DISTINCT tag_id) = {})",
-                placeholders,
-                tag_ids.len()
-            ));
-            for tag_id in tag_ids {
-                param_values.push(Box::new(tag_id.clone()));
-            }
-        }
-    }
-
-    match filter.ai_metadata_status.as_deref() {
-        Some("filled") => conditions.push(
-            "mf.id IN (SELECT media_id FROM ai_metadata WHERE prompt_text IS NOT NULL AND TRIM(prompt_text) != '')".to_string(),
-        ),
-        Some("empty") => conditions.push(
-            "mf.id NOT IN (SELECT media_id FROM ai_metadata WHERE prompt_text IS NOT NULL AND TRIM(prompt_text) != '')".to_string(),
-        ),
-        _ if filter.has_ai_metadata => conditions.push(
-            "mf.id IN (SELECT media_id FROM ai_metadata WHERE prompt_text IS NOT NULL AND TRIM(prompt_text) != '')".to_string(),
-        ),
-        _ => {}
-    }
-
-    if let Some(ref source_folder) = filter.source_folder {
-        if !source_folder.is_empty() {
-            conditions.push("mf.source_folder = ?".to_string());
-            param_values.push(Box::new(source_folder.clone()));
-        }
-    }
-
-    if let Some(ref keyword) = filter.keyword {
-        let trimmed = keyword.trim();
-        if !trimmed.is_empty() {
-            conditions.push("(mf.filename LIKE ? OR mf.filepath LIKE ?)".to_string());
-            let pattern = format!("%{}%", trimmed);
-            param_values.push(Box::new(pattern.clone()));
-            param_values.push(Box::new(pattern));
-        }
-    }
-
-    let group_placeholders = group_names.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let group_placeholders = group_names
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
     conditions.push(format!("c.name IN ({})", group_placeholders));
     for group_name in group_names {
         param_values.push(Box::new(group_name.clone()));
@@ -1218,8 +1303,11 @@ pub fn get_group_item_counts(
         where_clause
     );
 
-    let params_refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|value| value.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql).context("Failed to prepare group item counts query")?;
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        param_values.iter().map(|value| value.as_ref()).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare group item counts query")?;
     let rows = stmt
         .query_map(params_refs.as_slice(), |row| {
             Ok(GroupItemCount {
@@ -1269,25 +1357,31 @@ pub fn get_nav_item_counts(
         "SELECT nav_id, COUNT(*)
          FROM (
              SELECT CASE
-                 WHEN mf.source_folder = '灵感库' AND mf.is_trashed = 0 THEN 'library'
-                 WHEN mf.source_folder = 'AI 提示词库' AND mf.is_trashed = 0 THEN 'ai-prompts'
-                 WHEN mf.source_folder = '作品集' AND mf.is_trashed = 0 THEN 'projects'
                  WHEN mf.is_trashed = 1 THEN 'trash'
-                 ELSE mf.source_folder
+                 WHEN mf.source_folder = '灵感库' AND mf.is_trashed = 0 THEN 'library'
+                 WHEN mf.source_folder = '作品集' AND mf.is_trashed = 0 THEN 'projects'
+                 WHEN mf.is_trashed = 0 AND mf.id IN (
+                     SELECT media_id FROM ai_metadata
+                     WHERE prompt_text IS NOT NULL AND TRIM(prompt_text) != ''
+                 ) THEN 'ai-prompts'
+                 ELSE NULL
              END AS nav_id
              FROM media_files mf
              {}
          ) grouped
-         WHERE nav_id IN ({})
+         WHERE nav_id IS NOT NULL AND nav_id IN ({})
          GROUP BY nav_id",
-        inner_where_clause,
-        placeholders
+        inner_where_clause, placeholders
     );
 
-    let params_refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|value| value.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        param_values.iter().map(|value| value.as_ref()).collect();
 
-    let mut counts_by_nav: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    let mut stmt = conn.prepare(&sql).context("Failed to prepare nav item counts query")?;
+    let mut counts_by_nav: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare nav item counts query")?;
     let rows = stmt
         .query_map(params_refs.as_slice(), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -1314,24 +1408,42 @@ pub fn get_nav_item_counts(
 //  文件夹迁移后更新数据库路径
 // ─────────────────────────────────────────────
 
-/// 更新媒体文件路径中的旧文件夹名为新文件夹名
+/// 更新媒体文件路径中的旧文件夹名为新文件夹名。
+///
+/// 这是历史库迁移兼容逻辑，用于把旧版库目录名写入的 DB 记录改到当前目录名。
+/// Windows 反斜杠分支只处理旧记录格式，不代表运行时依赖 Windows 路径或盘符。
 /// - 媒体库 → 灵感库
 /// - 项目文件 → 作品集
 pub fn update_folder_paths_in_db(conn: &mut Connection) -> Result<i64> {
     eprintln!("[update_folder_paths_in_db] Updating database paths after folder migration...");
 
-    let tx = conn.transaction().context("Failed to begin transaction for folder migration")?;
+    let tx = conn
+        .transaction()
+        .context("Failed to begin transaction for folder migration")?;
     let mut updated_count = 0i64;
 
-    // 更新媒体库路径
+    // 更新媒体库路径（Windows 反斜杠）
     let media_lib_updated = tx.execute(
         "UPDATE media_files SET filepath = REPLACE(filepath, '\\\\媒体库\\\\', '\\\\灵感库\\\\') \
          WHERE filepath LIKE '%\\\\媒体库\\\\%'",
         [],
     )
     .context("Failed to update 媒体库 paths")? as i64;
-    eprintln!("[update_folder_paths_in_db] Updated {} media_files (媒体库→灵感库)", media_lib_updated);
+    eprintln!(
+        "[update_folder_paths_in_db] Updated {} media_files (媒体库→灵感库)",
+        media_lib_updated
+    );
     updated_count += media_lib_updated;
+
+    // macOS / Linux 正斜杠
+    let media_lib_unix = tx
+        .execute(
+            "UPDATE media_files SET filepath = REPLACE(filepath, '/媒体库/', '/灵感库/') \
+         WHERE filepath LIKE '%/媒体库/%'",
+            [],
+        )
+        .context("Failed to update 媒体库 paths (unix)")? as i64;
+    updated_count += media_lib_unix;
 
     // 更新项目文件路径
     let projects_updated = tx.execute(
@@ -1340,27 +1452,48 @@ pub fn update_folder_paths_in_db(conn: &mut Connection) -> Result<i64> {
         [],
     )
     .context("Failed to update 项目文件 paths")? as i64;
-    eprintln!("[update_folder_paths_in_db] Updated {} media_files (项目文件→作品集)", projects_updated);
+    eprintln!(
+        "[update_folder_paths_in_db] Updated {} media_files (项目文件→作品集)",
+        projects_updated
+    );
     updated_count += projects_updated;
 
+    let projects_unix = tx
+        .execute(
+            "UPDATE media_files SET filepath = REPLACE(filepath, '/项目文件/', '/作品集/') \
+         WHERE filepath LIKE '%/项目文件/%'",
+            [],
+        )
+        .context("Failed to update 项目文件 paths (unix)")? as i64;
+    updated_count += projects_unix;
+
     // 更新 source_folder 字段
-    let source_updated_1 = tx.execute(
-        "UPDATE media_files SET source_folder = '灵感库' WHERE source_folder = '媒体库'",
-        [],
-    )
-    .context("Failed to update source_folder 媒体库")? as i64;
+    let source_updated_1 = tx
+        .execute(
+            "UPDATE media_files SET source_folder = '灵感库' WHERE source_folder = '媒体库'",
+            [],
+        )
+        .context("Failed to update source_folder 媒体库")? as i64;
 
-    let source_updated_2 = tx.execute(
-        "UPDATE media_files SET source_folder = '作品集' WHERE source_folder = '项目文件'",
-        [],
-    )
-    .context("Failed to update source_folder 项目文件")? as i64;
+    let source_updated_2 = tx
+        .execute(
+            "UPDATE media_files SET source_folder = '作品集' WHERE source_folder = '项目文件'",
+            [],
+        )
+        .context("Failed to update source_folder 项目文件")? as i64;
 
-    tx.commit().context("Failed to commit folder migration transaction")?;
+    tx.commit()
+        .context("Failed to commit folder migration transaction")?;
 
-    eprintln!("[update_folder_paths_in_db] Updated {} source_folder entries", source_updated_1 + source_updated_2);
+    eprintln!(
+        "[update_folder_paths_in_db] Updated {} source_folder entries",
+        source_updated_1 + source_updated_2
+    );
 
-    eprintln!("[update_folder_paths_in_db] Database path migration completed. Total updated: {}", updated_count);
+    eprintln!(
+        "[update_folder_paths_in_db] Database path migration completed. Total updated: {}",
+        updated_count
+    );
     Ok(updated_count)
 }
 
@@ -1368,20 +1501,93 @@ fn normalize_windows_root(path: &str) -> String {
     path.replace('/', "\\").trim_end_matches('\\').to_string()
 }
 
-fn legacy_nocturne_root_from_path(path: &str) -> Option<String> {
-    let normalized = normalize_windows_root(path);
-    let marker = "\\NocturneGallery\\";
-    if let Some(index) = normalized.find(marker) {
-        return Some(normalized[..index + "\\NocturneGallery".len()].to_string());
+/// 写入 DB / REPLACE 时使用的库根（macOS/Linux 保持 `/`）。
+fn library_root_for_path_updates(library_root: &str) -> String {
+    let trimmed = library_root.trim().trim_end_matches(['\\', '/']);
+    #[cfg(windows)]
+    {
+        trimmed.replace('/', "\\")
     }
+    #[cfg(not(windows))]
+    {
+        trimmed.replace('\\', "/")
+    }
+}
 
-    normalized
-        .ends_with("\\NocturneGallery")
-        .then_some(normalized)
+fn legacy_library_folder_root_from_path(path: &str) -> Option<String> {
+    for dir_name in [
+        crate::media::library_folder::LEGACY_LIBRARY_DIR_NAME,
+        crate::media::library_folder::CURRENT_LIBRARY_DIR_NAME,
+    ] {
+        for sep in ['\\', '/'] {
+            let infix = format!("{}{}{}", sep, dir_name, sep);
+            if let Some(index) = path.find(&infix) {
+                let root_len = index + format!("{}{}", sep, dir_name).len();
+                return Some(path[..root_len].to_string());
+            }
+            let suffix = format!("{}{}", sep, dir_name);
+            if path.ends_with(&suffix) {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 从 filepath 推断「库根」前缀（例如 `/Users/.../Documents` 或 `/Users/.../gega`）。
+fn library_root_prefix_from_filepath(path: &str) -> Option<String> {
+    for marker in [
+        "/灵感库/",
+        "/作品集/",
+        "/回收站/",
+        "/渲染队列/",
+        "/AI 提示词库/",
+    ] {
+        if let Some(i) = path.find(marker) {
+            return Some(path[..i].to_string());
+        }
+    }
+    #[cfg(windows)]
+    for marker in ["\\灵感库\\", "\\作品集\\", "\\回收站\\"] {
+        if let Some(i) = path.find(marker) {
+            return Some(path[..i].to_string());
+        }
+    }
+    None
+}
+
+/// 修复 macOS 上曾被误写成反斜杠的路径（会导致 convertFileSrc 404）。
+pub fn repair_unix_path_separators_in_media_paths(conn: &Connection) -> Result<i64> {
+    #[cfg(windows)]
+    {
+        let _ = conn;
+        return Ok(0);
+    }
+    #[cfg(not(windows))]
+    {
+        let mut n = 0i64;
+        for col in [
+            "filepath",
+            "thumbnail_path",
+            "thumbnail_micro_path",
+            "thumbnail_preview_path",
+        ] {
+            n += conn
+                .execute(
+                    &format!(
+                        "UPDATE media_files SET {col} = REPLACE({col}, char(92), '/') WHERE instr({col}, char(92)) > 0"
+                    ),
+                    [],
+                )
+                .context("repair path separators")? as i64;
+        }
+        Ok(n)
+    }
 }
 
 pub fn update_library_root_prefixes(conn: &mut Connection, library_root: &str) -> Result<i64> {
-    let current_root = normalize_windows_root(library_root);
+    let current_root = library_root_for_path_updates(library_root);
+    let current_root_slash = current_root.replace('\\', "/");
     let mut legacy_roots = HashSet::new();
 
     {
@@ -1405,12 +1611,30 @@ pub fn update_library_root_prefixes(conn: &mut Connection, library_root: &str) -
         for row in rows {
             let (filepath, thumbnail_path, thumbnail_micro_path, thumbnail_preview_path) =
                 row.context("Failed to read legacy library root row")?;
-            for value in [filepath, thumbnail_path, thumbnail_micro_path, thumbnail_preview_path]
-                .into_iter()
-                .flatten()
+            for value in [
+                filepath,
+                thumbnail_path,
+                thumbnail_micro_path,
+                thumbnail_preview_path,
+            ]
+            .into_iter()
+            .flatten()
             {
-                if let Some(root) = legacy_nocturne_root_from_path(&value) {
-                    if !root.eq_ignore_ascii_case(&current_root) {
+                if let Some(root) = legacy_library_folder_root_from_path(&value) {
+                    if !root.eq_ignore_ascii_case(&current_root)
+                        && !root
+                            .replace('\\', "/")
+                            .eq_ignore_ascii_case(&current_root_slash)
+                    {
+                        legacy_roots.insert(root);
+                    }
+                }
+                if let Some(root) = library_root_prefix_from_filepath(&value) {
+                    let root_norm = normalize_windows_root(&root);
+                    let root_slash = root.replace('\\', "/");
+                    if !root_norm.eq_ignore_ascii_case(&current_root)
+                        && !root_slash.eq_ignore_ascii_case(&current_root_slash)
+                    {
                         legacy_roots.insert(root);
                     }
                 }
@@ -1494,7 +1718,10 @@ pub fn update_library_root_prefixes(conn: &mut Connection, library_root: &str) -
                     ],
                 )
                 .with_context(|| {
-                    format!("Failed to rebase slash-normalized {} from legacy library root", column)
+                    format!(
+                        "Failed to rebase slash-normalized {} from legacy library root",
+                        column
+                    )
                 })? as i64;
             updated_count += slash_updated;
         }
@@ -1533,14 +1760,15 @@ pub fn query_media_files_for_regenerate(conn: &Connection) -> Result<Vec<(String
 
 /// 清空所有缩略图路径记录
 pub fn clear_all_thumbnail_paths(conn: &Connection) -> Result<usize> {
-    let updated = conn.execute(
-        "UPDATE media_files SET
+    let updated = conn
+        .execute(
+            "UPDATE media_files SET
             thumbnail_path = NULL,
             thumbnail_micro_path = NULL,
             thumbnail_preview_path = NULL",
-        [],
-    )
-    .context("Failed to clear thumbnail paths")?;
+            [],
+        )
+        .context("Failed to clear thumbnail paths")?;
 
     Ok(updated)
 }
@@ -1592,17 +1820,23 @@ pub fn find_by_sha256(conn: &Connection, sha256: &str) -> Result<Option<MediaFil
 }
 
 /// 查询所有有 phash 的记录（用于相似性检测）
-pub fn find_by_phash_threshold(conn: &Connection, phash: u64, max_distance: u32) -> Result<Vec<MediaFile>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, filename, filepath, filetype, mime_type, width, height, \
+pub fn find_by_phash_threshold(
+    conn: &Connection,
+    phash: u64,
+    max_distance: u32,
+) -> Result<Vec<MediaFile>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, filename, filepath, filetype, mime_type, width, height, \
          file_size, created_at, modified_at, imported_at, thumbnail_path, \
          color_dominant, is_trashed, source_folder, sha256, phash, \
          thumbnail_micro_path, thumbnail_preview_path, thumbhash \
-         FROM media_files WHERE phash IS NOT NULL"
-    ).context("Failed to prepare phash query")?;
+         FROM media_files WHERE phash IS NOT NULL",
+        )
+        .context("Failed to prepare phash query")?;
 
     let files = stmt
-        .query_map([], |row| row_to_media_file(row))?
+        .query_map([], row_to_media_file)?
         .filter_map(|r| r.ok())
         .filter(|f| {
             if let Some(p) = f.phash {
@@ -1645,11 +1879,13 @@ pub fn update_file_hashes(conn: &Connection, id: &str, sha256: &str, phash: i64)
 
 /// 统计 sha256 为 NULL 的图片数量
 pub fn count_missing_hashes(conn: &Connection) -> Result<i64> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM media_files WHERE filetype = 'image' AND sha256 IS NULL",
-        [],
-        |row| row.get(0),
-    ).context("Failed to count missing hashes")?;
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM media_files WHERE filetype = 'image' AND sha256 IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .context("Failed to count missing hashes")?;
     Ok(count)
 }
 
@@ -1661,9 +1897,7 @@ pub fn backfill_hashes_batch(conn: &Connection, batch_size: i64) -> Result<Vec<(
     ).context("Failed to prepare backfill query")?;
 
     let rows: Vec<(String, String)> = stmt
-        .query_map(params![batch_size], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?
+        .query_map(params![batch_size], |row| Ok((row.get(0)?, row.get(1)?)))?
         .filter_map(|r| r.ok())
         .collect();
 
@@ -1747,7 +1981,9 @@ pub fn ai_search_items(
 
     let params_refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
 
-    let mut stmt = conn.prepare(&sql).context("Failed to prepare search query")?;
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare search query")?;
     let rows = stmt
         .query_map(params_refs.as_slice(), |row| {
             let tag_names: Option<String> = row.get(6)?;
@@ -1818,12 +2054,18 @@ pub fn add_media_tags(conn: &Connection, media_id: &str, tag_names: &[String]) -
 
 /// 设置素材分类（不存在则自动创建）
 pub fn set_media_category(conn: &Connection, media_id: &str, category_name: &str) -> Result<()> {
-    log::info!("[db] Setting category for item {}: {}", media_id, category_name);
+    log::info!(
+        "[db] Setting category for item {}: {}",
+        media_id,
+        category_name
+    );
     // 查找或创建 category
     let category_id: String = match conn
-        .query_row("SELECT id FROM categories WHERE name = ?", params![category_name], |r| {
-            r.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT id FROM categories WHERE name = ?",
+            params![category_name],
+            |r| r.get::<_, String>(0),
+        )
         .optional()
         .context("Failed to query category by name")?
     {
@@ -1850,13 +2092,9 @@ pub fn set_media_category(conn: &Connection, media_id: &str, category_name: &str
 
 /// 获取素材完整详情
 pub fn get_item_detail(conn: &Connection, id: &str) -> Result<Option<ItemDetail>> {
-    let row_opt: Option<(
-        String, String, String, String, Option<i32>, Option<i32>,
-        i64, Option<String>, Option<String>,
-        Option<String>, Option<String>, Option<String>, Option<String>,
-        i64,
-    )> = conn.query_row(
-        "SELECT mf.id, mf.filename, mf.filepath, mf.filetype,
+    let row_opt: Option<ItemDetailRow> = conn
+        .query_row(
+            "SELECT mf.id, mf.filename, mf.filepath, mf.filetype,
                 mf.width, mf.height, mf.file_size,
                 mf.thumbnail_path, mf.color_dominant,
                 am.prompt_text, am.model_name, am.platform,
@@ -1866,20 +2104,45 @@ pub fn get_item_detail(conn: &Connection, id: &str) -> Result<Option<ItemDetail>
          LEFT JOIN ai_metadata am ON am.media_id = mf.id
          LEFT JOIN categories c ON c.id = mf.category_id
          WHERE mf.id = ?",
-        params![id],
-        |row| {
-            Ok((
-                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                row.get(4)?, row.get(5)?, row.get(6)?,
-                row.get(7)?, row.get(8)?,
-                row.get(9)?, row.get(10)?, row.get(11)?,
-                row.get(12)?, row.get(13)?,
-            ))
-        },
-    ).optional().context("Failed to query item detail")?;
+            params![id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                ))
+            },
+        )
+        .optional()
+        .context("Failed to query item detail")?;
 
-    let (id, filename, filepath, filetype, width, height, file_size,
-         thumbnail_path, color_dominant, ai_prompt, ai_model, ai_platform, category_name, created_at) = match row_opt {
+    let (
+        id,
+        filename,
+        filepath,
+        filetype,
+        width,
+        height,
+        file_size,
+        thumbnail_path,
+        color_dominant,
+        ai_prompt,
+        ai_model,
+        ai_platform,
+        category_name,
+        created_at,
+    ) = match row_opt {
         Some(t) => t,
         None => return Ok(None),
     };
@@ -1916,11 +2179,13 @@ pub fn get_item_detail(conn: &Connection, id: &str) -> Result<Option<ItemDetail>
 pub fn update_ai_prompt_text(conn: &Connection, media_id: &str, prompt: &str) -> Result<()> {
     log::info!("[db] Updating AI prompt for item: {}", media_id);
     // 检查是否存在 ai_metadata 记录
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM ai_metadata WHERE media_id = ?)",
-        params![media_id],
-        |r| r.get(0),
-    ).context("Failed to check ai_metadata existence")?;
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM ai_metadata WHERE media_id = ?)",
+            params![media_id],
+            |r| r.get(0),
+        )
+        .context("Failed to check ai_metadata existence")?;
 
     if exists {
         conn.execute(
@@ -1963,7 +2228,9 @@ pub fn batch_get_item_summaries(conn: &Connection, ids: &[String]) -> Result<Vec
         placeholders
     );
 
-    let mut stmt = conn.prepare(&sql).context("Failed to prepare batch query")?;
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare batch query")?;
 
     let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
     let rows = stmt
@@ -1994,24 +2261,45 @@ pub fn batch_get_item_summaries(conn: &Connection, ids: &[String]) -> Result<Vec
 }
 
 /// 获取提示词反推数据
-pub fn get_reverse_prompt_data(conn: &Connection, item_id: &str) -> Result<Option<ReversePromptData>> {
-    let row_opt: Option<(String, String, String, Option<String>, Option<String>, i64, Option<String>, Option<String>)> = conn.query_row(
-        "SELECT mf.id, mf.filename, mf.filepath, mf.thumbnail_path,
+pub fn get_reverse_prompt_data(
+    conn: &Connection,
+    item_id: &str,
+) -> Result<Option<ReversePromptData>> {
+    let row_opt: Option<ReversePromptRow> = conn
+        .query_row(
+            "SELECT mf.id, mf.filename, mf.filepath, mf.thumbnail_path,
                 mf.color_dominant, mf.file_size, mf.mime_type,
                 am.prompt_text
          FROM media_files mf
          LEFT JOIN ai_metadata am ON am.media_id = mf.id
          WHERE mf.id = ?",
-        params![item_id],
-        |row| {
-            Ok((
-                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
-            ))
-        },
-    ).optional().context("Failed to query reverse prompt data")?;
+            params![item_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()
+        .context("Failed to query reverse prompt data")?;
 
-    let (item_id, filename, filepath, thumbnail_path, color_dominant, file_size, mime_type, existing_prompt) = match row_opt {
+    let (
+        item_id,
+        filename,
+        filepath,
+        thumbnail_path,
+        color_dominant,
+        file_size,
+        mime_type,
+        existing_prompt,
+    ) = match row_opt {
         Some(t) => t,
         None => return Ok(None),
     };
@@ -2030,11 +2318,13 @@ pub fn get_reverse_prompt_data(conn: &Connection, item_id: &str) -> Result<Optio
 
 /// 获取库统计信息
 pub fn get_library_stats(conn: &Connection) -> Result<LibraryStats> {
-    let total_items: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM media_files WHERE is_trashed = 0",
-        [],
-        |r| r.get(0),
-    ).context("Failed to count total items")?;
+    let total_items: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM media_files WHERE is_trashed = 0",
+            [],
+            |r| r.get(0),
+        )
+        .context("Failed to count total items")?;
 
     let total_with_prompt: i64 = conn.query_row(
         "SELECT COUNT(*) FROM media_files mf WHERE mf.is_trashed = 0 AND EXISTS (SELECT 1 FROM ai_metadata am WHERE am.media_id = mf.id AND am.prompt_text IS NOT NULL AND TRIM(am.prompt_text) != '')",
@@ -2044,26 +2334,24 @@ pub fn get_library_stats(conn: &Connection) -> Result<LibraryStats> {
 
     let total_without_prompt = total_items - total_with_prompt;
 
-    let total_tags: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM tags",
-        [],
-        |r| r.get(0),
-    ).context("Failed to count tags")?;
+    let total_tags: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))
+        .context("Failed to count tags")?;
 
-    let total_categories: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM categories",
-        [],
-        |r| r.get(0),
-    ).context("Failed to count categories")?;
+    let total_categories: i64 = conn
+        .query_row("SELECT COUNT(*) FROM categories", [], |r| r.get(0))
+        .context("Failed to count categories")?;
 
-    let mut tag_stmt = conn.prepare(
-        "SELECT t.name, COUNT(mt.media_id) as cnt
+    let mut tag_stmt = conn
+        .prepare(
+            "SELECT t.name, COUNT(mt.media_id) as cnt
          FROM tags t
          INNER JOIN media_tags mt ON mt.tag_id = t.id
          GROUP BY t.id
          ORDER BY cnt DESC
-         LIMIT 10"
-    ).context("Failed to prepare top tags query")?;
+         LIMIT 10",
+        )
+        .context("Failed to prepare top tags query")?;
 
     let top_tags: Vec<TagCount> = tag_stmt
         .query_map([], |row| {
@@ -2089,12 +2377,25 @@ pub fn get_library_stats(conn: &Connection) -> Result<LibraryStats> {
 }
 
 /// 保存搜索结果到书签表
-pub fn insert_search_bookmark(conn: &mut Connection, title: &str, url: &str, content: &str, tags: Option<&[String]>) -> Result<i64> {
-    let tx = conn.transaction().context("Failed to begin transaction for search bookmark")?;
+pub fn insert_search_bookmark(
+    conn: &mut Connection,
+    title: &str,
+    url: &str,
+    content: &str,
+    tags: Option<&[String]>,
+) -> Result<i64> {
+    let tx = conn
+        .transaction()
+        .context("Failed to begin transaction for search bookmark")?;
 
     tx.execute(
         "INSERT INTO bookmarks (url, title, description, tags) VALUES (?1, ?2, ?3, ?4)",
-        params![url, title, content, tags.map(|t| t.join(",")).unwrap_or_default()],
+        params![
+            url,
+            title,
+            content,
+            tags.map(|t| t.join(",")).unwrap_or_default()
+        ],
     )
     .context("Failed to insert bookmark")?;
 
@@ -2104,7 +2405,9 @@ pub fn insert_search_bookmark(conn: &mut Connection, title: &str, url: &str, con
     if let Some(tag_list) = tags {
         for name in tag_list {
             let name = name.trim();
-            if name.is_empty() { continue; }
+            if name.is_empty() {
+                continue;
+            }
 
             let tag_id: String = match tx
                 .query_row("SELECT id FROM tags WHERE name = ?", params![name], |r| {
@@ -2134,6 +2437,218 @@ pub fn insert_search_bookmark(conn: &mut Connection, title: &str, url: &str, con
         }
     }
 
-    tx.commit().context("Failed to commit search bookmark transaction")?;
+    tx.commit()
+        .context("Failed to commit search bookmark transaction")?;
     Ok(record_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use std::path::PathBuf;
+
+    struct TestDb {
+        conn: Connection,
+        db_path: PathBuf,
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.db_path);
+            let _ = std::fs::remove_file(self.db_path.with_extension("db-wal"));
+            let _ = std::fs::remove_file(self.db_path.with_extension("db-shm"));
+            if let Some(parent) = self.db_path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+
+    fn test_db() -> TestDb {
+        let dir = std::env::temp_dir().join(format!("gega-crud-test-{}", Uuid::new_v4()));
+        let db_path = dir.join("nocturne.db");
+        db::init_db(db_path.to_string_lossy().as_ref()).expect("init test db");
+        let conn = db::open_conn(db_path.to_string_lossy().as_ref()).expect("open test db");
+        TestDb { conn, db_path }
+    }
+
+    fn media(id: &str, root: &str, source_folder: &str, filename: &str) -> MediaFile {
+        MediaFile {
+            id: id.to_string(),
+            filename: filename.to_string(),
+            filepath: format!(
+                "{}/{}/{}",
+                root.trim_end_matches('/'),
+                source_folder,
+                filename
+            ),
+            filetype: "image".to_string(),
+            mime_type: Some("image/png".to_string()),
+            width: Some(100),
+            height: Some(100),
+            file_size: 1000,
+            created_at: 1,
+            modified_at: 1,
+            imported_at: 1,
+            thumbnail_path: None,
+            thumbnail_micro_path: None,
+            thumbnail_preview_path: None,
+            thumbhash: None,
+            color_dominant: None,
+            is_trashed: false,
+            source_folder: Some(source_folder.to_string()),
+            sha256: None,
+            phash: None,
+        }
+    }
+
+    fn insert_category(conn: &Connection, id: &str, name: &str) {
+        conn.execute(
+            "INSERT INTO categories (id, name, sort_order) VALUES (?1, ?2, 0)",
+            params![id, name],
+        )
+        .expect("insert category");
+    }
+
+    fn assign_category(conn: &Connection, media_id: &str, category_id: &str) {
+        conn.execute(
+            "UPDATE media_files SET category_id = ?1 WHERE id = ?2",
+            params![category_id, media_id],
+        )
+        .expect("assign category");
+    }
+
+    fn insert_prompt(conn: &Connection, media_id: &str, prompt: &str) {
+        conn.execute(
+            "INSERT INTO ai_metadata (id, media_id, prompt_text, model_name, platform, created_at)
+             VALUES (?1, ?2, ?3, 'test-model', 'test', 1)",
+            params![Uuid::new_v4().to_string(), media_id, prompt],
+        )
+        .expect("insert prompt");
+    }
+
+    fn insert_tag(conn: &Connection, media_id: &str, tag: &str) {
+        let tag_id = format!("tag-{}", tag);
+        conn.execute(
+            "INSERT OR IGNORE INTO tags (id, name, color) VALUES (?1, ?2, '#6B7280')",
+            params![tag_id, tag],
+        )
+        .expect("insert tag");
+        conn.execute(
+            "INSERT OR IGNORE INTO media_tags (media_id, tag_id) VALUES (?1, ?2)",
+            params![media_id, tag_id],
+        )
+        .expect("insert media tag");
+    }
+
+    #[test]
+    fn virtual_ai_prompts_view_uses_prompt_metadata_across_source_folders() {
+        let db = test_db();
+        let root = "/tmp/gega-library";
+        insert_media_file(&db.conn, &media("prompted", root, "灵感库", "prompted.png")).unwrap();
+        insert_media_file(&db.conn, &media("plain", root, "灵感库", "plain.png")).unwrap();
+        insert_media_file(
+            &db.conn,
+            &media("project-prompt", root, "作品集", "project.png"),
+        )
+        .unwrap();
+        insert_prompt(&db.conn, "prompted", "cinematic lighting");
+        insert_prompt(&db.conn, "project-prompt", "portfolio prompt");
+        rebuild_media_search_index(&db.conn).unwrap();
+
+        let filter = MediaFilter {
+            virtual_ai_prompts_view: true,
+            library_root_path: Some(root.to_string()),
+            ..MediaFilter::default()
+        };
+
+        let (items, total, _) = query_media_files(&db.conn, 1, 20, &filter, None, false).unwrap();
+        let ids = items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(total, 2);
+        assert!(ids.contains("prompted"));
+        assert!(ids.contains("project-prompt"));
+        assert!(!ids.contains("plain"));
+    }
+
+    #[test]
+    fn group_counts_and_detail_are_limited_to_library_root() {
+        let db = test_db();
+        let root = "/tmp/gega-library";
+        let outside_root = "/tmp/other-library";
+        insert_category(&db.conn, "cat-a", "灵感");
+        insert_media_file(&db.conn, &media("inside", root, "灵感库", "inside.png")).unwrap();
+        insert_media_file(
+            &db.conn,
+            &media("outside", outside_root, "灵感库", "outside.png"),
+        )
+        .unwrap();
+        assign_category(&db.conn, "inside", "cat-a");
+        assign_category(&db.conn, "outside", "cat-a");
+
+        let filter = MediaFilter {
+            library_root_path: Some(root.to_string()),
+            ..MediaFilter::default()
+        };
+        let counts = get_group_item_counts(&db.conn, &filter, &[String::from("灵感")]).unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[0].count, 1);
+
+        assert!(get_media_detail(&db.conn, "inside", Some(root))
+            .unwrap()
+            .is_some());
+        assert!(get_media_detail(&db.conn, "outside", Some(root))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn category_name_filter_keeps_small_groups_isolated() {
+        let db = test_db();
+        let root = "/tmp/gega-library";
+        insert_category(&db.conn, "cat-a", "A组");
+        insert_category(&db.conn, "cat-b", "B组");
+        insert_media_file(&db.conn, &media("a", root, "灵感库", "a.png")).unwrap();
+        insert_media_file(&db.conn, &media("b", root, "灵感库", "b.png")).unwrap();
+        assign_category(&db.conn, "a", "cat-a");
+        assign_category(&db.conn, "b", "cat-b");
+
+        let filter = MediaFilter {
+            category_name: Some("A组".to_string()),
+            library_root_path: Some(root.to_string()),
+            ..MediaFilter::default()
+        };
+        let (items, total, _) = query_media_files(&db.conn, 1, 20, &filter, None, false).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, "a");
+    }
+
+    #[test]
+    fn search_filter_matches_list_and_group_counts() {
+        let db = test_db();
+        let root = "/tmp/gega-library";
+        insert_category(&db.conn, "cat-a", "灵感");
+        insert_media_file(&db.conn, &media("match", root, "灵感库", "match.png")).unwrap();
+        insert_media_file(&db.conn, &media("miss", root, "灵感库", "miss.png")).unwrap();
+        assign_category(&db.conn, "match", "cat-a");
+        assign_category(&db.conn, "miss", "cat-a");
+        insert_prompt(&db.conn, "match", "neon skyline composition");
+        insert_tag(&db.conn, "match", "赛博");
+        rebuild_media_search_index(&db.conn).unwrap();
+
+        let filter = MediaFilter {
+            keyword: Some("skyline".to_string()),
+            library_root_path: Some(root.to_string()),
+            ..MediaFilter::default()
+        };
+        let (items, total, _) = query_media_files(&db.conn, 1, 20, &filter, None, false).unwrap();
+        let counts = get_group_item_counts(&db.conn, &filter, &[String::from("灵感")]).unwrap();
+
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, "match");
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[0].count, 1);
+    }
 }

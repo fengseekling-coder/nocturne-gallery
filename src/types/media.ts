@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — 媒体类型定义
+ * Gega Gallery — 媒体类型定义
  *
  * 与 Rust 结构体保持一致（src-tauri/src/）
  */
@@ -76,6 +76,8 @@ export interface MediaFilter {
   sourceFolder?: string | null;
   libraryRootPath?: string | null;
   keyword?: string | null;
+  /** AI 提示词库虚拟大分组：全库按 Prompt/AI 条件筛选，不按 source_folder */
+  virtualAiPromptsView?: boolean;
 }
 
 /** Keyset 分页游标（后端返回，用于下一页请求） */

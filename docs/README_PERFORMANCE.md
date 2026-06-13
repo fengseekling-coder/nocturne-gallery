@@ -1,8 +1,8 @@
 列表分页 `MEDIA_PAGE_SIZE=400`；全量重建见 `regenerate_all_thumbnails`。
 
-# 🚀 Nocturne Gallery 性能优化套件
+# 🚀 Gega Gallery 性能优化套件
 
-本目录包含用于测试和优化 Nocturne Gallery 性能的工具和文档。
+本目录包含用于测试和优化 Gega Gallery 性能的工具和文档。
 
 ## 📁 文件说明
 

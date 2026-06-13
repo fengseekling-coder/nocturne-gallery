@@ -1,4 +1,4 @@
-# Nocturne Gallery 性能优化总结
+# Gega Gallery 性能优化总结
 
 ## 🎯 优化目标
 

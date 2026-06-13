@@ -1,5 +1,13 @@
+pub mod design_source;
+pub mod hash;
+pub mod library_folder;
+pub mod library_relocate;
+pub mod library_sync;
+pub mod media_bundle;
+pub mod os_preview;
+pub mod path_util;
 pub mod scanner;
 pub mod thumbnail;
 pub mod thumbnail_queue;
+pub mod trash_reconcile;
 pub mod watcher;
-pub mod hash;

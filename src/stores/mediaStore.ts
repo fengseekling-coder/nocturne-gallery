@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — Media Store
+ * Gega Gallery — Media Store
  *
  * 管理媒体文件列表、选中状态、分页、过滤及详情缓存。
  * 通过 Tauri invoke 调用 Rust 后端 Commands。
@@ -15,7 +15,8 @@ import type { MediaFile, MediaDetail, MediaFilter, MediaPage, MediaCursor, Tag, 
 
 /** detailCache 最大条目数，超出时淘汰最久未访问的条目 */
 const MAX_DETAIL_CACHE = 50;
-const MEDIA_PAGE_SIZE = 400;
+/** 与 Rust `get_media_files` 的 `per_page.clamp(1, 200)` 一致 */
+const MEDIA_PAGE_SIZE = 200;
 
 let latestMediaListRequestToken = 0;
 let latestSelectFileRequestToken = 0;
@@ -154,6 +155,8 @@ interface MediaActions {
   applyFilters: (activeNav: string, sourceFolder: string | null, activeTab: string) => Promise<void>;
   /** 更新单个文件信息（乐观更新） */
   updateFile: (mediaId: string, updates: Partial<MediaFile>) => void;
+  /** 网格解码后补全宽高，用于 Masonry 按原图比例排布 */
+  applyLayoutDimensions: (mediaId: string, width: number, height: number) => void;
   /** 刷新单个文件记录（通常用于后台处理完成后补全元数据） */
   refreshFileById: (mediaId: string) => Promise<void>;
 }
@@ -213,6 +216,7 @@ function buildFilterSignature(filter: MediaFilter): string {
     aiMetadataStatus: filter.aiMetadataStatus ?? '',
     sourceFolder: filter.sourceFolder ?? '',
     keyword: filter.keyword ?? '',
+    virtualAiPromptsView: !!filter.virtualAiPromptsView,
   });
 }
 
@@ -598,16 +602,17 @@ export const useMediaStore = create<MediaState & MediaActions>((set, get) => ({
   /** 根据导航项切换过滤条件 */
   filterByNav: async (activeNav: string, sourceFolder: string | null) => {
     const requestToken = ++latestMediaListRequestToken;
+    const isAiPromptsNav = activeNav === 'ai-prompts';
     const filter: MediaFilter = {
       tagIds: null,
       categoryId: null,
       categoryName: null,
-      // 回收站导航显示回收站文件夹的文件
       onlyTrashed: activeNav === 'trash',
       fileTypes: null,
       hasAiMetadata: false,
       aiMetadataStatus: null,
-      sourceFolder: sourceFolder || undefined,
+      sourceFolder: isAiPromptsNav ? undefined : (sourceFolder || undefined),
+      virtualAiPromptsView: isAiPromptsNav,
     };
     // 先设置 isLoading，不提前清空 files（避免闪烁空状态）
     set({ filter, isLoading: true, nextCursor: null });
@@ -691,16 +696,18 @@ export const useMediaStore = create<MediaState & MediaActions>((set, get) => ({
   applyFilters: async (activeNav: string, sourceFolder: string | null, activeTab: string) => {
     const requestToken = ++latestMediaListRequestToken;
     const { filter: currentFilter } = get();
+    const isAiPromptsNav = activeNav === 'ai-prompts';
     const filter: MediaFilter = {
       tagIds: currentFilter.tagIds,
       categoryId: currentFilter.categoryId,
       categoryName: null,
       onlyTrashed: activeNav === 'trash',
       fileTypes: null,
-      hasAiMetadata: currentFilter.hasAiMetadata,
+      hasAiMetadata: false,
       aiMetadataStatus: null,
-      sourceFolder: sourceFolder || undefined,
+      sourceFolder: isAiPromptsNav ? undefined : (sourceFolder || undefined),
       keyword: currentFilter.keyword ?? null,
+      virtualAiPromptsView: isAiPromptsNav,
     };
 
     if (activeTab === '图片') {
@@ -726,9 +733,10 @@ export const useMediaStore = create<MediaState & MediaActions>((set, get) => ({
         return;
       }
       set((state) => {
-        computeFilesUpdateStats(state.files, result.items, 'replace');
+        const nextFiles = reconcileFiles([], result.items);
+        computeFilesUpdateStats(state.files, nextFiles, 'replace');
         return {
-          files: result.items,
+          files: nextFiles,
           currentPage: result.page,
           totalCount: result.total,
           nextCursor: result.nextCursor ?? null,
@@ -760,6 +768,34 @@ export const useMediaStore = create<MediaState & MediaActions>((set, get) => ({
         detailCache: {
           ...state.detailCache,
           [mediaId]: { ...existingDetail, file: { ...existingDetail.file, ...updates } },
+        },
+      };
+    });
+  },
+
+  // ----------------------------------------------------------------
+  applyLayoutDimensions: (mediaId, width, height) => {
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+      return;
+    }
+    set((state) => {
+      const file = state.files.find((f) => f.id === mediaId);
+      if (!file) return state;
+      if (file.width === width && file.height === height) return state;
+      const updated = { ...file, width, height };
+      const updatedFiles = state.files.map((f) => (f.id === mediaId ? updated : f));
+      const existingDetail = state.detailCache[mediaId];
+      void invoke('update_media_dimensions', { id: mediaId, width, height }).catch((err) => {
+        console.warn('[mediaStore] update_media_dimensions failed:', err);
+      });
+      if (!existingDetail) {
+        return { files: updatedFiles };
+      }
+      return {
+        files: updatedFiles,
+        detailCache: {
+          ...state.detailCache,
+          [mediaId]: { ...existingDetail, file: updated },
         },
       };
     });

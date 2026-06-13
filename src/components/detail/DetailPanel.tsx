@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — DetailPanel (Inspector)
+ * Gega Gallery — DetailPanel (Inspector)
  *
  * 右侧详情面板：大图预览、元数据、标签编辑、AI 提示词区。
  * 背景 var(--color-bg-structure)，padding 24px。
@@ -14,6 +14,7 @@ import { useUiStore } from '../../stores/uiStore';
 import { TagBadge } from '../common/TagBadge';
 import { Icon } from '../common/Icon';
 import { WindowControls } from '../common/WindowControls';
+import { detectUiPlatform } from '../../lib/platform';
 import { getPreference, setPreference } from '../../utils/preferences';
 import { ModelCombobox } from './ModelCombobox';
 import { AttachmentPanel } from './AttachmentPanel';
@@ -22,6 +23,13 @@ import { useAgentChat } from '../../hooks/useAgentChat';
 import { ProviderType } from '../../lib/ai/types';
 import { MediaDetail, MediaFile, MediaAttachment } from '../../types/media';
 import { normalizeTransferredFilePath } from '../../utils/filePath';
+import { pickInspectorThumbnailPath } from '../../lib/gridThumbnail';
+import { resolveDisplaySrc } from '../../lib/loadFullResolution';
+import {
+  ensureDesignPreviewThumbnails,
+  fetchShellPreviewDataUrl,
+  needsDesignPreviewBackfill,
+} from '../../lib/designPreview';
 
 // ----------------------------------------------------------------
 // MetaRow：Label-MD 样式的单行元数据
@@ -169,6 +177,7 @@ type AttachmentKind = 'image' | 'video' | 'pdf';
 type BatchFileOperationResult = {
   succeeded: number;
   failed: number;
+  first_error?: string | null;
 };
 
 interface NativePathFile extends File {
@@ -260,6 +269,7 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({ inspectorWidth, setIns
   // 从 uiStore 获取 AI 模式状态
   const isAIMode = useUiStore((s) => s.isAIMode);
   const toggleAIMode = useUiStore((s) => s.toggleAIMode);
+  const isMacUi = detectUiPlatform() === 'macos';
 
   const inspectorMediaId = selectedId ?? canvasAttachmentPreview?.ownerMediaId ?? null;
   const detail = useMediaStore((s) => (inspectorMediaId ? s.detailCache[inspectorMediaId] ?? null : null));
@@ -335,6 +345,11 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({ inspectorWidth, setIns
   const [isAttachmentDragOver, setIsAttachmentDragOver] = useState(false);
   const [previewAttachmentId, setPreviewAttachmentId] = useState<string | null>(null);
   const [activePreviewAttachment, _setActivePreviewAttachment] = useState<MediaAttachment | null>(null);
+  const [inspectorPreviewDiskPath, setInspectorPreviewDiskPath] = useState<string | null>(null);
+  const [inspectorPreviewFailed, setInspectorPreviewFailed] = useState(false);
+  const [inspectorShellPreviewSrc, setInspectorShellPreviewSrc] = useState<string | null>(null);
+  const inspectorDesignBackfillRef = useRef<string | null>(null);
+  const updateFile = useMediaStore((s) => s.updateFile);
 
   // 批量标签添加状态
   const [_isAddingBatchTag, setIsAddingBatchTag] = useState(false);
@@ -1154,21 +1169,6 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({ inspectorWidth, setIns
     }
   }, [detail?.file.colorDominant]);
 
-  const detailPreviewSrc = useMemo(() => {
-    if (!detail) return null;
-    const previewPath = detail.file.thumbnailPreviewPath || detail.file.thumbnailPath;
-    if (previewPath) {
-      return convertFileSrc(previewPath);
-    }
-    if (
-      detail.file.fileSize <= MAX_INLINE_ORIGINAL_PREVIEW_BYTES
-      && canPreviewOriginalImage(detail.file.filename)
-    ) {
-      return convertFileSrc(detail.file.filepath);
-    }
-    return null;
-  }, [detail]);
-
   const inspectorAttachment = useMemo(() => {
     const attachmentId = canvasActiveAttachmentId ?? previewAttachmentId;
     if (!attachmentId) return null;
@@ -1180,8 +1180,92 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({ inspectorWidth, setIns
     return attachmentPreviewMap[inspectorAttachment.id] ?? null;
   }, [attachmentPreviewMap, inspectorAttachment]);
 
+  useEffect(() => {
+    setInspectorPreviewFailed(false);
+    setInspectorShellPreviewSrc(null);
+    if (inspectorAttachment) {
+      setInspectorPreviewDiskPath(null);
+      return;
+    }
+    if (!detail) {
+      setInspectorPreviewDiskPath(null);
+      return;
+    }
+    const diskPath = pickInspectorThumbnailPath(detail.file);
+    if (diskPath) {
+      setInspectorPreviewDiskPath(diskPath);
+      return;
+    }
+    if (
+      detail.file.fileSize <= MAX_INLINE_ORIGINAL_PREVIEW_BYTES
+      && canPreviewOriginalImage(detail.file.filename)
+    ) {
+      setInspectorPreviewDiskPath(detail.file.filepath);
+      return;
+    }
+    setInspectorPreviewDiskPath(null);
+
+    if (!needsDesignPreviewBackfill(detail.file)) return;
+    if (inspectorDesignBackfillRef.current === detail.file.id) return;
+    inspectorDesignBackfillRef.current = detail.file.id;
+
+    void ensureDesignPreviewThumbnails(detail.file.id).then((updated) => {
+      if (updated) {
+        updateFile(updated.id, {
+          thumbnailMicroPath: updated.thumbnailMicroPath,
+          thumbnailPath: updated.thumbnailPath,
+          thumbnailPreviewPath: updated.thumbnailPreviewPath,
+          thumbhash: updated.thumbhash,
+          width: updated.width,
+          height: updated.height,
+        });
+        const next = pickInspectorThumbnailPath(updated);
+        if (next) {
+          setInspectorPreviewDiskPath(next);
+          setInspectorPreviewFailed(false);
+        }
+        return;
+      }
+      void fetchShellPreviewDataUrl(detail.file.filepath, 640).then((url) => {
+        if (url) setInspectorShellPreviewSrc(url);
+      });
+    });
+  }, [
+    detail,
+    inspectorAttachment,
+    updateFile,
+    detail?.file.id,
+    detail?.file.filepath,
+    detail?.file.thumbnailMicroPath,
+    detail?.file.thumbnailPath,
+    detail?.file.thumbnailPreviewPath,
+    detail?.file.fileSize,
+    detail?.file.filename,
+    detail?.file.filetype,
+  ]);
+
+  const handleInspectorPreviewError = useCallback(() => {
+    if (!detail || inspectorAttachment) return;
+    const filepath = detail.file.filepath?.trim();
+    if (
+      filepath
+      && inspectorPreviewDiskPath !== filepath
+      && (detail.file.filetype === 'image' || detail.file.filetype === 'video')
+    ) {
+      setInspectorPreviewDiskPath(filepath);
+      setInspectorPreviewFailed(false);
+      return;
+    }
+    setInspectorPreviewFailed(true);
+  }, [detail, inspectorAttachment, inspectorPreviewDiskPath]);
+
   const inspectorDisplayName = inspectorAttachment?.filename ?? detail?.file.filename ?? '';
-  const inspectorDisplayPreviewSrc = inspectorAttachmentPreviewSrc ?? detailPreviewSrc;
+  const inspectorDisplayPreviewSrc = inspectorAttachment
+    ? inspectorAttachmentPreviewSrc
+    : (inspectorShellPreviewSrc
+      ?? (inspectorPreviewDiskPath && !inspectorPreviewFailed
+        ? resolveDisplaySrc(inspectorPreviewDiskPath)
+        : null));
   const inspectorDisplayPath = inspectorAttachment?.filepath ?? detail?.file.filepath ?? '';
   const inspectorDisplayFormat = inspectorDisplayName.includes('.')
     ? inspectorDisplayName.split('.').pop()!.toUpperCase()
@@ -1594,10 +1678,12 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({ inspectorWidth, setIns
           </button>
         </div>
 
-        {/* 右侧窗口控制按钮 */}
-        <div className="no-drag" style={{ position: 'relative', width: '108px', height: '48px', flexShrink: 0 }}>
-          <WindowControls topOffset={0} rightOffset={0} />
-        </div>
+        {/* Windows/Linux：右侧窗口按钮；macOS 仅侧栏左上角一套红绿灯 */}
+        {!isMacUi && (
+          <div className="no-drag" style={{ position: 'relative', width: '108px', height: '48px', flexShrink: 0 }}>
+            <WindowControls topOffset={0} rightOffset={0} />
+          </div>
+        )}
       </div>
 
       {/* 拖拽条 */}
@@ -1670,7 +1756,7 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({ inspectorWidth, setIns
                       fetchFiles(1);
                       window.dispatchEvent(new CustomEvent('trash-updated'));
                     } else {
-                      showToast('批量移入回收站失败');
+                      showToast(result.first_error?.trim() || '批量移入回收站失败');
                     }
                   } catch {
                     showToast('批量移入回收站失败');
@@ -1682,7 +1768,13 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({ inspectorWidth, setIns
               <>
                 <div style={{ position: 'relative', width: '100%', height: '228px', background: 'var(--bg-card)', borderRadius: '18px', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, boxShadow: 'inset 0 0 0 1px var(--border)' }}>
                   {inspectorDisplayPreviewSrc ? (
-                    <img src={inspectorDisplayPreviewSrc} alt={inspectorDisplayName} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+                    <img
+                      src={inspectorDisplayPreviewSrc}
+                      alt={inspectorDisplayName}
+                      decoding="async"
+                      onError={handleInspectorPreviewError}
+                      style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+                    />
                   ) : !inspectorAttachment && isVideoFile(detail.file.filename) ? (
                     /* 视频文件无缩略图时的占位块 */
                     <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '8px', backgroundColor: 'var(--bg-hover)' }}>

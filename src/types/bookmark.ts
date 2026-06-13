@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — 网页书签类型定义
+ * Gega Gallery — 网页书签类型定义
  */
 
 export interface Bookmark {

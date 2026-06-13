@@ -1484,7 +1484,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = React.memo(({
             onPaste={handlePaste} onDragEnter={handleChatComposerDragEnter} onDragOver={handleChatComposerDragOver}
             onDragLeave={handleChatComposerDragLeave} onDrop={(e) => { void handleChatComposerDrop(e); }}
             onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendChat(); } }}
-            placeholder="问 Gega 任何关于这张素材的问题…" rows={1}
+            placeholder="问 Gega Gallery 任何关于这张素材的问题…" rows={1}
             style={{ width: '100%', minHeight: '80px', maxHeight: '240px', height: '80px', padding: '2px 2px 0',
               backgroundColor: 'transparent', border: 'none', color: 'var(--text-primary)', fontSize: '13px',
               outline: 'none', resize: 'none', display: 'block', fontFamily: 'var(--font-family)',

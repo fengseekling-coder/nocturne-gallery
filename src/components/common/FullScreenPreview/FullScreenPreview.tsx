@@ -1,10 +1,10 @@
 /**
- * Nocturne Gallery — FullScreenPreview
+ * Gega Gallery — FullScreenPreview
  *
  * 大图全屏预览组件
  */
 
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState } from 'react';
 import { loadFullResolution, resolveDisplaySrc } from '../../../lib/loadFullResolution';
 import { Icon } from '../Icon';
 
@@ -31,7 +31,6 @@ export const FullScreenPreview: React.FC<FullScreenPreviewProps> = ({
 }) => {
   const [displaySrc, setDisplaySrc] = useState<string>('');
   const [isLoadingOriginal, setIsLoadingOriginal] = useState(false);
-  const originalAbortRef = useRef<AbortController | null>(null);
   const [scale, setScale] = useState(1);
 
   useEffect(() => {
@@ -43,24 +42,15 @@ export const FullScreenPreview: React.FC<FullScreenPreviewProps> = ({
   }, [onClose]);
 
   useEffect(() => {
-    if (originalAbortRef.current) originalAbortRef.current.abort();
-
-    const abortController = new AbortController();
-    originalAbortRef.current = abortController;
-
     const cleanup = loadFullResolution({
       imagePath: imageUrl,
       thumbnailPreviewPath,
       originalDelayMs: 120,
-      signal: abortController.signal,
       onDisplayPathChange: setDisplaySrc,
       onLoadingOriginalChange: setIsLoadingOriginal,
     });
 
-    return () => {
-      abortController.abort();
-      cleanup();
-    };
+    return () => cleanup();
   }, [imageUrl, thumbnailPreviewPath]);
 
   return (

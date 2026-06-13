@@ -1,6 +1,12 @@
 # Security Policy
 
-Nocturne Gallery is a local-first desktop application. Security-sensitive areas include local file access, media scanning, SQLite persistence, drag-and-drop import/export, shell/open-file behavior, and AI provider configuration.
+Gega Gallery is a local-first desktop application. Security-sensitive areas include local file access, media scanning, SQLite persistence, drag-and-drop import/export, shell/open-file behavior, and AI provider configuration.
+
+## Local-First and Optional AI Network Access
+
+Gega Gallery does not require login, cloud sync, telemetry, or background upload for its core library features. Media files, prompts, metadata, thumbnails, attachments, and provider settings are stored locally.
+
+Optional AI features may contact a provider only when the user configures a provider and actively invokes an AI action. Provider API keys and model settings are local preferences; they must not be silently uploaded, synchronized, or logged. Any future AI feature that sends media content, prompts, file paths, or metadata to a provider must make that behavior explicit in the UI and documentation.
 
 ## Reporting a Vulnerability
 

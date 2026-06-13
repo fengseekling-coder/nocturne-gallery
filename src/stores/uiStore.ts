@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — UI Store
+ * Gega Gallery — UI Store
  *
  * 管理界面布局状态（侧边栏、详情面板、导航、Toast）。
  * 主题状态使用 SQLite 持久化（user_preferences 表），启动时异步加载并应用到 document。
@@ -170,10 +170,10 @@ export const useUiStore = create<UiState & UiActions>()((set, get) => {
       // - 网页管理 (web-pages) → 无对应文件夹 (独立数据库表)
       const folderMap: Record<string, string | null> = {
         'library': '灵感库',
-        'ai-prompts': 'AI 提示词库',
+        'ai-prompts': null,
         'projects': '作品集',
         'trash': '回收站',
-        'web-pages': null, // 网页管理不对应本地文件夹
+        'web-pages': null,
       };
       set({ activeNav: id, sourceFolder: folderMap[id] || null, activeTab: '全部', canvasAttachmentPreview: null });
     },

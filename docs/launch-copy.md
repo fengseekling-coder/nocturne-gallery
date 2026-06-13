@@ -30,7 +30,7 @@ Local-first desktop workspace for visual references, prompts, and source attachm
 
 ## Hacker News Title
 
-Show HN: Nocturne Gallery, a local-first desktop workspace for creative references
+Show HN: Gega Gallery, a local-first desktop workspace for creative references
 
 ## Reddit Title
 
@@ -42,7 +42,7 @@ I am building an open-source local-first desktop workspace for visual references
 
 ## English Short Post
 
-Nocturne Gallery is an open-source, local-first desktop workspace for creative reference work.
+Gega Gallery is an open-source, local-first desktop workspace for creative reference work.
 
 It is built for designers, AI creators, creative workers, and indie makers who collect images, prompts, source files, and web inspiration across too many tools. The current app focuses on local media organization, grouping, search, prompt notes, attachment references, duplicate detection, preview context, and desktop drag-in / drag-out workflows.
 
@@ -52,7 +52,7 @@ GitHub: https://github.com/fengseekling-coder/nocturne-gallery
 
 ## Chinese Short Post
 
-Nocturne Gallery 是一个开源、本地优先的桌面创意素材库。
+Gega Gallery 是一个开源、本地优先的桌面创意素材库。
 
 它面向设计师、AI 创作者、创意工作者和独立开发者，解决参考图、Prompt、源文件附件和网页灵感分散在文件夹、浏览器、AI 工具、设计软件里的问题。当前版本重点支持本地素材整理、分组、搜索、Prompt 记录、外部附件引用、重复检测、预览上下文，以及桌面端拖入 / 拖出工作流。
 

@@ -23,7 +23,7 @@ The highest-priority asset is `screenshot-inspector.png`, because it shows the c
 
 ### `screenshot-gallery.png`
 
-Purpose: answer "What does Nocturne Gallery look like?"
+Purpose: answer "What does Gega Gallery look like?"
 
 Show:
 
@@ -108,7 +108,7 @@ Keep the GIF focused. It should answer: "Why use this instead of continuing with
 
 ### `screenshot-duplicates.png`
 
-Purpose: show that Nocturne Gallery helps keep a creative library from becoming messy over time.
+Purpose: show that Gega Gallery helps keep a creative library from becoming messy over time.
 
 Show:
 
@@ -147,7 +147,7 @@ Once the real assets exist, the README first screen should embed only the two st
 ```md
 ## Preview
 
-![Nocturne Gallery main gallery](docs/assets/screenshot-gallery.png)
+![Gega Gallery main gallery](docs/assets/screenshot-gallery.png)
 
 ![Inspector with prompt and attachments](docs/assets/screenshot-inspector.png)
 ```
@@ -179,7 +179,7 @@ Use one consistent desktop app window size across the required screenshots so th
 Use a dedicated safe demo library such as:
 
 ```text
-Nocturne Demo Library
+Gega Gallery Demo Library
   Product References
   UI Inspiration
   AI Prompt Studies

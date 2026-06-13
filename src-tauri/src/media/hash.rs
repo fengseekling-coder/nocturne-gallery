@@ -1,10 +1,8 @@
-/**
- * Nocturne Gallery — 图像哈希计算
- *
- * 双重验证：
- * 1. SHA256 文件哈希（字节级完全相同 → 直接判定重复）
- * 2. pHash 感知哈希（视觉内容几乎一致 → 汉明距离 ≤ 3 判定重复）
- */
+//! Gega Gallery — 图像哈希计算
+//!
+//! 双重验证：
+//! 1. SHA256 文件哈希（字节级完全相同 → 直接判定重复）
+//! 2. pHash 感知哈希（视觉内容几乎一致 → 汉明距离 ≤ 3 判定重复）
 
 use image::{imageops, GrayImage};
 use sha2::{Digest, Sha256};
@@ -12,8 +10,8 @@ use std::path::Path;
 
 /// SHA256 文件哈希（十六进制字符串）
 pub fn compute_sha256(file_path: &str) -> Result<String, String> {
-    let data = std::fs::read(file_path)
-        .map_err(|e| format!("Failed to read file for SHA256: {}", e))?;
+    let data =
+        std::fs::read(file_path).map_err(|e| format!("Failed to read file for SHA256: {}", e))?;
     Ok(compute_sha256_from_bytes(&data))
 }
 
@@ -21,20 +19,28 @@ pub fn compute_sha256(file_path: &str) -> Result<String, String> {
 /// 直接用裸 File + 手动 buf，避免 BufReader 双缓冲冗余。
 pub fn compute_sha256_streaming(file_path: &str) -> Result<String, String> {
     use std::io::Read;
-    let mut file = std::fs::File::open(file_path)
-        .map_err(|e| {
-            log::warn!("[hash] compute_sha256_streaming open failed for '{}': {}", file_path, e);
-            format!("Failed to open file for streaming SHA256: {}", e)
-        })?;
+    let mut file = std::fs::File::open(file_path).map_err(|e| {
+        log::warn!(
+            "[hash] compute_sha256_streaming open failed for '{}': {}",
+            file_path,
+            e
+        );
+        format!("Failed to open file for streaming SHA256: {}", e)
+    })?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65536];
     loop {
-        let n = file.read(&mut buf)
-            .map_err(|e| {
-                log::warn!("[hash] compute_sha256_streaming read failed for '{}': {}", file_path, e);
-                format!("Failed to read chunk for SHA256: {}", e)
-            })?;
-        if n == 0 { break; }
+        let n = file.read(&mut buf).map_err(|e| {
+            log::warn!(
+                "[hash] compute_sha256_streaming read failed for '{}': {}",
+                file_path,
+                e
+            );
+            format!("Failed to read chunk for SHA256: {}", e)
+        })?;
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
@@ -61,6 +67,7 @@ pub fn compute_phash(image_path: &str) -> Result<u64, String> {
 /// 2. 转灰度
 /// 3. 行 DCT（每行保留前 8 个系数）→ 列 DCT（每列保留前 8 个系数）
 /// 4. 取左上角 8×8 低频矩阵，与 AC 均值比较，生成 64 位哈希
+#[allow(clippy::needless_range_loop)]
 pub fn compute_phash_from_image(img: &image::DynamicImage) -> Result<u64, String> {
     // Triangle 滤波速度约为 Lanczos3 的 5 倍，对 8×8 DCT 精度影响可忽略
     let resized = imageops::resize(img, 32, 32, imageops::FilterType::Triangle);

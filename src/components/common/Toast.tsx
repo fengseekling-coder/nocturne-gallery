@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — Toast
+ * Gega Gallery — Toast
  *
  * 全局 Toast 通知，固定底部居中。
  * 出入动画：translateY(16px) opacity 0 → translateY(0) opacity 1，150ms ease。

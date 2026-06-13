@@ -13,6 +13,8 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    /** 仅给 Tauri 内嵌 WebView 用，不要自动用系统浏览器打开 */
+    open: false,
   },
   // 环境变量前缀
   envPrefix: ['VITE_', 'TAURI_'],

@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — WebPage 网页管理页面
+ * Gega Gallery — WebPage 网页管理页面
  *
  * 收藏网页链接，右键空白处或点击顶部「+」按钮添加
  */

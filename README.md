@@ -1,8 +1,8 @@
-# Nocturne Gallery
+# Gega Gallery
 
 Open-source, local-first desktop workspace for visual references, prompts, and source attachments.
 
-Nocturne Gallery is for designers, AI creators, creative workers, and indie makers who collect visual inspiration while moving between folders, browsers, AI tools, and design software. It brings reference images, prompts, grouping, duplicate checks, and external source-file attachments into one private desktop library.
+Gega Gallery is for designers, AI creators, creative workers, and indie makers who collect visual inspiration while moving between folders, browsers, AI tools, and design software. It brings reference images, prompts, grouping, duplicate checks, and external source-file attachments into one private desktop library.
 
 一个开源、本地优先的桌面工作台，把参考图、Prompt 和源文件附件整理在同一个创意素材库里。
 
@@ -30,7 +30,7 @@ Creative reference work often spreads across too many places:
 - Source files, project files, and related references are easy to lose after the final image is saved.
 - The same asset is imported again because it was renamed, moved, or saved from another source.
 
-Nocturne Gallery tries to collect that creative context into a local private library, so visual references, prompts, grouping, duplicate detection, preview context, and source attachments stay close to the work they describe.
+Gega Gallery tries to collect that creative context into a local private library, so visual references, prompts, grouping, duplicate detection, preview context, and source attachments stay close to the work they describe.
 
 ## Core Workflows
 
@@ -78,7 +78,7 @@ Planned path: `docs/assets/demo-import.gif`
 
 ## Privacy Model
 
-Nocturne Gallery is local-first by design:
+Gega Gallery is local-first by design:
 
 - Media files stay on your device.
 - SQLite data is stored locally.
@@ -91,7 +91,7 @@ Read the fuller privacy notes in [docs/PRIVACY.md](./docs/PRIVACY.md).
 
 ## How It Is Different
 
-Nocturne Gallery is not a normal photo album, a cloud asset library, a bookmark manager, a note-first vault, or a simple reference board.
+Gega Gallery is not a normal photo album, a cloud asset library, a bookmark manager, a note-first vault, or a simple reference board.
 
 It is closer to a private creative workspace than a photo album: local-first, open-source, desktop-native, and centered on the relationship between visual references, prompts, source attachments, duplicate detection, and drag-in / drag-out workflows.
 
@@ -109,6 +109,8 @@ This repository is an early public release of an active desktop application. The
 Packaging, release artifacts, automated regression tests, public screenshots, and cross-platform polish are still being improved. There is currently no packaged GitHub Release in this repository, so the project should be built from source.
 
 ## Build from Source
+
+> **Repository layout:** Clone and work only inside `nocturne-gallery/`. The parent folder may be a wrapper; run `npm install` and all scripts from that directory (not the repo root).
 
 ### Prerequisites
 
@@ -139,10 +141,14 @@ npm run tauri:dev
 ### Validate
 
 ```bash
+npm run lint
 npm run typecheck
+npm run audit:commands   # frontend invoke ↔ Rust handlers
 npm run build
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
+
+Optional: `npm run test:e2e` (requires `npm run dev` on port 1420). Performance: `npm run perf:test` / `npm run perf:report`.
 
 On macOS, if Vite/Rollup fails to load `@rollup/rollup-darwin-arm64` because of a local code-signing mismatch, reinstall Node dependencies or run with a Node binary that can load ad-hoc signed native add-ons. This is an environment issue, not an application source issue.
 

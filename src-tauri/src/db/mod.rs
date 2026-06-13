@@ -150,48 +150,52 @@ pub fn init_db(db_path: &str) -> anyhow::Result<()> {
 
     // 性能优化：设置 PRAGMA
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-    conn.execute_batch("PRAGMA cache_size=-64000;")?;  // 64MB cache
+    conn.execute_batch("PRAGMA cache_size=-64000;")?; // 64MB cache
     conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
-    conn.execute_batch("PRAGMA mmap_size=536870912;")?;  // 512MB mmap
+    conn.execute_batch("PRAGMA mmap_size=536870912;")?; // 512MB mmap
 
     // 执行建表 SQL
     conn.execute_batch(SCHEMA_SQL)
         .context("Failed to execute schema SQL")?;
 
     // 执行迁移：添加 source_folder 列（如果不存在）
-    conn.execute_batch(
-        "ALTER TABLE media_files ADD COLUMN source_folder TEXT;",
-    ).ok();
+    conn.execute_batch("ALTER TABLE media_files ADD COLUMN source_folder TEXT;")
+        .ok();
 
     conn.execute(
         "ALTER TABLE media_files ADD COLUMN pre_trash_folder TEXT;",
         [],
-    ).ok();
+    )
+    .ok();
 
     // 执行迁移：添加 sha256 和 phash 列（重复检测）
     conn.execute_batch(
         "ALTER TABLE media_files ADD COLUMN sha256 TEXT;
          ALTER TABLE media_files ADD COLUMN phash INTEGER;",
-    ).ok();
+    )
+    .ok();
 
     // 执行迁移：添加 category_id 列（AI Agent 分类管理）
-    conn.execute_batch(
-        "ALTER TABLE media_files ADD COLUMN category_id TEXT;",
-    ).ok();
+    conn.execute_batch("ALTER TABLE media_files ADD COLUMN category_id TEXT;")
+        .ok();
 
     // 创建索引（如果不存在）
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_media_files_category ON media_files(category_id);",
-    ).ok();
+    )
+    .ok();
 
     // 执行迁移：添加缩略图多档位列（v5.8 升级）
     // 备份 DB：只在首次迁移时执行（检查 thumbhash 列是否已存在）
-    let has_thumbhash: bool = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('media_files') WHERE name='thumbhash'",
-        [],
-        |r| r.get::<_, i64>(0),
-    ).unwrap_or(0) > 0;
+    let has_thumbhash: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('media_files') WHERE name='thumbhash'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
 
     if !has_thumbhash {
         // 备份 DB 到 .nocturne/backup_v58_{YYYYMMDD}.db
@@ -216,7 +220,8 @@ pub fn init_db(db_path: &str) -> anyhow::Result<()> {
         "ALTER TABLE media_files ADD COLUMN thumbnail_micro_path TEXT;
          ALTER TABLE media_files ADD COLUMN thumbnail_preview_path TEXT;
          ALTER TABLE media_files ADD COLUMN thumbhash TEXT;",
-    ).ok();
+    )
+    .ok();
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS media_attachments (

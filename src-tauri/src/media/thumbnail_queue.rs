@@ -13,12 +13,7 @@ pub struct ThumbnailTask {
 }
 
 impl ThumbnailTask {
-    pub fn new(
-        media_id: &str,
-        filepath: &str,
-        thumbs_dir: &str,
-        db_path: &str,
-    ) -> Option<Self> {
+    pub fn new(media_id: &str, filepath: &str, thumbs_dir: &str, db_path: &str) -> Option<Self> {
         if !std::path::Path::new(filepath).exists() {
             return None;
         }
@@ -69,7 +64,11 @@ impl ThumbnailQueue {
             for task in tasks {
                 q.push_back(task);
             }
-            eprintln!("[thumbnail_queue] Batch added {} tasks, queue size: {}", count, q.len());
+            eprintln!(
+                "[thumbnail_queue] Batch added {} tasks, queue size: {}",
+                count,
+                q.len()
+            );
         }
         self.condvar.notify_one();
     }
@@ -104,21 +103,30 @@ impl ThumbnailQueue {
                 };
 
                 if let Some(task) = task {
-                    eprintln!("[thumbnail_queue] Processing task for media_id: {}", task.media_id);
+                    eprintln!(
+                        "[thumbnail_queue] Processing task for media_id: {}",
+                        task.media_id
+                    );
                     match generate_thumbnail_task(&task) {
                         Ok(thumb_path) => {
                             eprintln!("[thumbnail_queue] Thumbnail generated: {}", thumb_path);
-                            let _ = app_handle.emit("thumbnail-generated", serde_json::json!({
-                                "mediaId": task.media_id,
-                                "thumbnailPath": thumb_path,
-                            }));
+                            let _ = app_handle.emit(
+                                "thumbnail-generated",
+                                serde_json::json!({
+                                    "mediaId": task.media_id,
+                                    "thumbnailPath": thumb_path,
+                                }),
+                            );
                         }
                         Err(e) => {
                             eprintln!("[thumbnail_queue] Failed to generate thumbnail: {}", e);
-                            let _ = app_handle.emit("thumbnail-failed", serde_json::json!({
-                                "mediaId": task.media_id,
-                                "error": e.to_string(),
-                            }));
+                            let _ = app_handle.emit(
+                                "thumbnail-failed",
+                                serde_json::json!({
+                                    "mediaId": task.media_id,
+                                    "error": e.to_string(),
+                                }),
+                            );
                         }
                     }
                 }
@@ -197,9 +205,21 @@ pub fn create_thumbnail_task(
 
     let is_supported = matches!(
         ext.as_deref(),
-        Some("jpg") | Some("jpeg") | Some("png") | Some("gif") | Some("webp") |
-        Some("bmp") | Some("tiff") | Some("avif") | Some("heic") | Some("svg") |
-        Some("mp4") | Some("mov") | Some("avi") | Some("mkv") | Some("webm")
+        Some("jpg")
+            | Some("jpeg")
+            | Some("png")
+            | Some("gif")
+            | Some("webp")
+            | Some("bmp")
+            | Some("tiff")
+            | Some("avif")
+            | Some("heic")
+            | Some("svg")
+            | Some("mp4")
+            | Some("mov")
+            | Some("avi")
+            | Some("mkv")
+            | Some("webm")
     );
 
     if !is_supported {

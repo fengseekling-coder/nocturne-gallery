@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use walkdir::WalkDir;
 use rayon::prelude::*;
+use walkdir::WalkDir;
 
 use crate::db::{crud, open_conn};
 use crate::media::hash as image_hash;
-use crate::models::{MediaFile, ScanResult, FileMetaJSON};
+use crate::models::{FileMetaJSON, MediaFile, ScanResult};
 
-use std::sync::Arc;
 use once_cell::sync::Lazy;
+use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 const FAST_DIMENSION_MAX_BYTES: i64 = 2 * 1024 * 1024;
@@ -29,32 +29,9 @@ pub static LIGHT_ENRICH_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| {
 pub static HEAVY_ENRICH_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(1)));
 pub static IMPORT_COPY_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(2)));
 
-/// 支持的文件扩展名列表（小写）
-const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "avif", "heic", "svg"];
-const VIDEO_EXTS: &[&str] = &["mp4", "mov", "avi", "mkv", "webm", "flv"];
 const _3D_EXTS: &[&str] = &["obj", "fbx", "glb", "gltf", "blend", "stl"];
-const DOC_EXTS: &[&str] = &["pdf", "psd", "ai", "sketch", "fig", "xd", "zip", "rar"];
-
 fn classify_extension(ext: &str) -> Option<&'static str> {
-    let lower = ext.to_lowercase();
-    let lower = lower.as_str();
-    if IMAGE_EXTS.contains(&lower) {
-        return Some("image");
-    }
-    if VIDEO_EXTS.contains(&lower) {
-        return Some("video");
-    }
-    if _3D_EXTS.contains(&lower) {
-        return Some("3d");
-    }
-    if DOC_EXTS.contains(&lower) {
-        // PSD/AI 等设计文件归类为 design，其他为 document
-        if matches!(lower, "psd" | "ai" | "sketch" | "fig" | "xd") {
-            return Some("design");
-        }
-        return Some("document");
-    }
-    None
+    crate::media::design_source::classify_extension(ext)
 }
 
 // ─────────────────────────────────────────────
@@ -88,7 +65,12 @@ pub fn scan_directory(path: &str, db_path: &str, thumbs_dir: &str) -> Result<Sca
 ///   Phase 1 — 串行：收集文件路径列表（仅文件系统元数据，极快）
 ///   Phase 2 — 并行：rayon par_iter 每文件独立处理（SHA256、图片解码、pHash、缩略图、颜色）
 ///   Phase 3 — 串行：DB INSERT（WAL 模式下低竞争，毫秒级）
-fn scan_directory_inner(path: &str, db_path: &str, _thumbs_dir: &str, on_new: &mut dyn FnMut(&str)) -> Result<ScanResult> {
+fn scan_directory_inner(
+    path: &str,
+    db_path: &str,
+    _thumbs_dir: &str,
+    on_new: &mut dyn FnMut(&str),
+) -> Result<ScanResult> {
     eprintln!("[scanner] Opening DB at: {}", db_path);
     let conn = open_conn(db_path).context("Failed to open DB in scan_directory")?;
     eprintln!("[scanner] DB opened successfully");
@@ -101,18 +83,28 @@ fn scan_directory_inner(path: &str, db_path: &str, _thumbs_dir: &str, on_new: &m
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            if !e.file_type().is_file() { return false; }
+            if !e.file_type().is_file() {
+                return false;
+            }
             let p = e.path();
-            if p.components().any(|c| c.as_os_str() == ".nocturne") { return false; }
-            if p.components().any(|c| c.as_os_str() == ".nocturne_meta") { return false; }
-            p.extension().and_then(|x| x.to_str())
+            if p.components().any(|c| c.as_os_str() == ".nocturne") {
+                return false;
+            }
+            if p.components().any(|c| c.as_os_str() == ".nocturne_meta") {
+                return false;
+            }
+            p.extension()
+                .and_then(|x| x.to_str())
                 .map(|ext| classify_extension(ext).is_some())
                 .unwrap_or(false)
         })
         .collect();
 
     let scanned_count = entries.len() as i64;
-    eprintln!("[scanner] Phase 1 complete: {} candidate files", scanned_count);
+    eprintln!(
+        "[scanner] Phase 1 complete: {} candidate files",
+        scanned_count
+    );
 
     // ── Phase 2: 并行处理（CPU/IO 密集：哈希、解码、缩略图、颜色）──
     let root_str = root_path.to_string_lossy().to_string();
@@ -122,7 +114,10 @@ fn scan_directory_inner(path: &str, db_path: &str, _thumbs_dir: &str, on_new: &m
         .filter_map(|entry| process_file_entry_parallel(&entry, std::path::Path::new(&root_str)))
         .collect();
 
-    eprintln!("[scanner] Phase 2 complete: {} entries processed", processed.len());
+    eprintln!(
+        "[scanner] Phase 2 complete: {} entries processed",
+        processed.len()
+    );
 
     // ── Phase 3: 串行 DB INSERT（WAL 模式，写入轻量）──
     let mut imported_count: i64 = 0;
@@ -137,21 +132,38 @@ fn scan_directory_inner(path: &str, db_path: &str, _thumbs_dir: &str, on_new: &m
                     eprintln!("[scanner] Restored from JSON meta: {}", entry.filename);
                     if let Some(ref tags) = entry.tags_to_write {
                         if !tags.is_empty() {
-                            if let Err(e) = crud::update_media_tags(&conn, &entry.media_file.id, tags) {
-                                eprintln!("[scanner] Failed to write tags for {}: {}", entry.filename, e);
+                            if let Err(e) =
+                                crud::update_media_tags(&conn, &entry.media_file.id, tags)
+                            {
+                                eprintln!(
+                                    "[scanner] Failed to write tags for {}: {}",
+                                    entry.filename, e
+                                );
                             }
                         }
                     }
                     if let Some(ref prompt) = entry.prompt_to_write {
                         if !prompt.is_empty() {
-                            if let Err(e) = crud::upsert_ai_metadata(&conn, &entry.media_file.id, prompt, "", "") {
-                                eprintln!("[scanner] Failed to write ai_metadata for {}: {}", entry.filename, e);
+                            if let Err(e) = crud::upsert_ai_metadata(
+                                &conn,
+                                &entry.media_file.id,
+                                prompt,
+                                "",
+                                "",
+                            ) {
+                                eprintln!(
+                                    "[scanner] Failed to write ai_metadata for {}: {}",
+                                    entry.filename, e
+                                );
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[scanner] Failed to restore from JSON meta for {}: {}", entry.filename, e);
+                    eprintln!(
+                        "[scanner] Failed to restore from JSON meta for {}: {}",
+                        entry.filename, e
+                    );
                     skipped_count += 1;
                 }
             }
@@ -167,14 +179,20 @@ fn scan_directory_inner(path: &str, db_path: &str, _thumbs_dir: &str, on_new: &m
                     eprintln!("[scanner] Skipped (already exists): {}", entry.filename);
                 }
                 Err(e) => {
-                    eprintln!("[scanner] Failed to insert {}: {}", entry.media_file.filepath, e);
+                    eprintln!(
+                        "[scanner] Failed to insert {}: {}",
+                        entry.media_file.filepath, e
+                    );
                     skipped_count += 1;
                 }
             }
         }
     }
 
-    eprintln!("[scanner] Phase 3 complete: imported={}, skipped={}", imported_count, skipped_count);
+    eprintln!(
+        "[scanner] Phase 3 complete: imported={}, skipped={}",
+        imported_count, skipped_count
+    );
 
     Ok(ScanResult {
         scanned_count,
@@ -204,14 +222,22 @@ fn process_file_entry_parallel(
 
     let metadata = std::fs::metadata(file_path).ok()?;
     let file_size = metadata.len() as i64;
-    let modified_at = metadata.modified().ok()
+    let modified_at = metadata
+        .modified()
+        .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64).unwrap_or(0);
-    let created_at = metadata.created().ok()
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let created_at = metadata
+        .created()
+        .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64).unwrap_or(modified_at);
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(modified_at);
     let imported_at = Utc::now().timestamp();
-    let mime_type = mime_guess::from_path(file_path).first().map(|m| m.to_string());
+    let mime_type = mime_guess::from_path(file_path)
+        .first()
+        .map(|m| m.to_string());
 
     let (width, height) = if filetype == "image" && file_size <= FAST_DIMENSION_MAX_BYTES {
         match image::image_dimensions(file_path) {
@@ -225,7 +251,9 @@ fn process_file_entry_parallel(
     let filename = file_path.file_name()?.to_str()?.to_string();
     let filepath = file_path.to_string_lossy().to_string();
 
-    let source_folder = file_path.strip_prefix(root_path).ok()
+    let source_folder = file_path
+        .strip_prefix(root_path)
+        .ok()
         .and_then(|p| p.components().next())
         .and_then(|c| c.as_os_str().to_str())
         .filter(|s| !s.is_empty())
@@ -233,18 +261,23 @@ fn process_file_entry_parallel(
 
     let id = uuid::Uuid::new_v4().to_string();
 
-    let meta_dir = file_path.parent()
+    let meta_dir = file_path
+        .parent()
         .unwrap_or(std::path::Path::new("."))
         .join(".nocturne_meta");
 
     // ── 快速路径：JSON 元数据已存在且完整 ──
-    let loaded_meta = load_and_migrate_meta_json(file_path, &meta_dir, &filename)
-        .and_then(|meta| {
-            let thumb_check = file_path.parent()
+    let loaded_meta =
+        load_and_migrate_meta_json(file_path, &meta_dir, &filename).and_then(|meta| {
+            let thumb_check = file_path
+                .parent()
                 .unwrap_or(std::path::Path::new("."))
                 .join(&meta.thumbnail);
             let has_thumbnail = !meta.thumbnail.is_empty() && thumb_check.exists();
-            let has_colors = meta.color_dominant.as_deref().map_or(false, |c| !c.is_empty());
+            let has_colors = meta
+                .color_dominant
+                .as_deref()
+                .is_some_and(|c| !c.is_empty());
             if has_thumbnail && (has_colors || filetype == "video") {
                 Some(meta)
             } else {
@@ -253,10 +286,12 @@ fn process_file_entry_parallel(
         });
 
     if let Some(ref meta) = loaded_meta {
-        let thumb_abs = file_path.parent()
+        let thumb_abs = file_path
+            .parent()
             .unwrap_or(std::path::Path::new("."))
             .join(&meta.thumbnail)
-            .to_string_lossy().to_string();
+            .to_string_lossy()
+            .to_string();
         let media_file = MediaFile {
             id,
             filename: filename.clone(),
@@ -291,7 +326,9 @@ fn process_file_entry_parallel(
     // ── 慢速路径：计算所有元数据 ──
     let ext_lower = ext.to_lowercase();
 
-    let (sha256, phash, thumbnail_path, color_dominant, decoded_width, decoded_height) = if filetype == "image" {
+    let (sha256, phash, thumbnail_path, color_dominant, decoded_width, decoded_height) = if filetype
+        == "image"
+    {
         if ext_lower == "svg" {
             // SVG：直接复制原文件作为缩略图，不解码
             let sha = image_hash::compute_sha256(&filepath).ok();
@@ -307,11 +344,18 @@ fn process_file_entry_parallel(
                     match image::load_from_memory(&bytes) {
                         Ok(img) => {
                             let ph = image_hash::compute_phash_from_image(&img)
-                                .ok().map(|p| p as i64);
+                                .ok()
+                                .map(|p| p as i64);
                             let width = Some(img.width() as i32);
                             let height = Some(img.height() as i32);
                             let (thumb, colors) = generate_thumbnail_and_colors_no_db(
-                                &id, Some(&img), file_path, &meta_dir, &filename, &sha, &ph,
+                                &id,
+                                Some(&img),
+                                file_path,
+                                &meta_dir,
+                                &filename,
+                                &sha,
+                                &ph,
                             );
                             (sha, ph, thumb, colors, width, height)
                         }
@@ -385,7 +429,11 @@ fn extract_psd_thumbnail_to_file(
     filename: &str,
 ) -> Option<String> {
     if let Err(e) = std::fs::create_dir_all(meta_dir) {
-        log::warn!("[scanner] Failed to create .nocturne_meta for {}: {}", filename, e);
+        log::warn!(
+            "[scanner] Failed to create .nocturne_meta for {}: {}",
+            filename,
+            e
+        );
         return None;
     }
 
@@ -394,7 +442,11 @@ fn extract_psd_thumbnail_to_file(
             let thumb_filename = format!("{}_thumb.jpg", filename);
             let thumb_path = meta_dir.join(&thumb_filename);
             if let Err(e) = std::fs::write(&thumb_path, &jpeg_bytes) {
-                log::warn!("[scanner] Failed to write PSD thumbnail for {}: {}", filename, e);
+                log::warn!(
+                    "[scanner] Failed to write PSD thumbnail for {}: {}",
+                    filename,
+                    e
+                );
                 return None;
             }
             // 写 meta JSON（无颜色数据，PSD 嵌入缩略图通常很小不适合采色）
@@ -413,7 +465,11 @@ fn extract_psd_thumbnail_to_file(
             Some(abs)
         }
         Err(e) => {
-            log::warn!("[scanner] No embedded thumbnail in PSD '{}': {}", filename, e);
+            log::warn!(
+                "[scanner] No embedded thumbnail in PSD '{}': {}",
+                filename,
+                e
+            );
             None
         }
     }
@@ -432,12 +488,19 @@ fn generate_thumbnail_and_colors_no_db(
     phash: &Option<i64>,
 ) -> (Option<String>, Option<String>) {
     if let Err(e) = std::fs::create_dir_all(meta_dir) {
-        log::warn!("[scanner] Failed to create .nocturne_meta for {}: {}", filename, e);
+        log::warn!(
+            "[scanner] Failed to create .nocturne_meta for {}: {}",
+            filename,
+            e
+        );
         return (None, None);
     }
 
-    let ext_lower = file_path.extension().and_then(|e| e.to_str())
-        .unwrap_or("").to_lowercase();
+    let ext_lower = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
 
     let thumb_filename = format!("{}_thumb.jpg", filename);
     let thumb_path = meta_dir.join(&thumb_filename);
@@ -517,22 +580,33 @@ pub fn scan_single_file_minimal(
     let file_record_path = std::path::Path::new(record_path);
     let root_path = std::path::Path::new(library_root);
 
-    let ext = file_record_path.extension().and_then(|e| e.to_str())
-        .ok_or_else(|| anyhow::anyhow!("No extension"))?.to_string();
+    let ext = file_record_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .ok_or_else(|| anyhow::anyhow!("No extension"))?
+        .to_string();
     let filetype = classify_extension(&ext)
         .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", ext))?;
 
     let metadata = std::fs::metadata(file_read_path).context("Failed to read file metadata")?;
     let file_size = metadata.len() as i64;
-    let modified_at = metadata.modified().ok()
+    let modified_at = metadata
+        .modified()
+        .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64).unwrap_or(0);
-    let created_at = metadata.created().ok()
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let created_at = metadata
+        .created()
+        .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64).unwrap_or(modified_at);
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(modified_at);
     let imported_at = Utc::now().timestamp();
 
-    let mime_type = mime_guess::from_path(file_record_path).first().map(|m| m.to_string());
+    let mime_type = mime_guess::from_path(file_record_path)
+        .first()
+        .map(|m| m.to_string());
 
     // 读取原图真实宽高，用于 Masonry 按原始比例预留高度
     // 这里必须记录源图尺寸，而不是缩略图尺寸或近似值。
@@ -544,10 +618,16 @@ pub fn scan_single_file_minimal(
         (None, None)
     };
 
-    let filename = file_record_path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    let filename = file_record_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
     let id = uuid::Uuid::new_v4().to_string();
 
-    let source_folder = file_record_path.strip_prefix(root_path).ok()
+    let source_folder = file_record_path
+        .strip_prefix(root_path)
+        .ok()
         .and_then(|p| p.components().next())
         .and_then(|c| c.as_os_str().to_str())
         .filter(|s| !s.is_empty())
@@ -578,16 +658,21 @@ pub fn scan_single_file_minimal(
 
     crud::insert_or_restore_media_file(&conn, &media_file)?;
 
+    let parent_dir = file_record_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let meta_dir = parent_dir.join(".nocturne_meta");
+
     if filetype == "image" {
-        let parent_dir = file_record_path.parent().unwrap_or(std::path::Path::new("."));
-        let meta_dir = parent_dir.join(".nocturne_meta");
         std::fs::create_dir_all(&meta_dir).context("Failed to create .nocturne_meta")?;
         let micro_dst = meta_dir.join(format!("{}_micro.webp", filename));
         if !micro_dst.exists() {
             if let Ok(img) = image::open(file_read_path) {
-                let _ = crate::media::thumbnail::generate_micro_thumbnail_from_image(&img, &micro_dst);
+                let _ =
+                    crate::media::thumbnail::generate_micro_thumbnail_from_image(&img, &micro_dst);
             } else {
-                let _ = crate::media::thumbnail::generate_micro_thumbnail(file_read_path, &micro_dst);
+                let _ =
+                    crate::media::thumbnail::generate_micro_thumbnail(file_read_path, &micro_dst);
             }
         }
         if micro_dst.exists() {
@@ -600,6 +685,27 @@ pub fn scan_single_file_minimal(
                 None,
             )?;
         }
+    } else if filetype == "design" || filetype == "document" {
+        let ext_l = ext.to_lowercase();
+        if crate::media::design_source::needs_source_preview_for_filetype_and_ext(filetype, &ext_l)
+        {
+            let read_fp = if file_read_path.is_file() {
+                read_path.to_string()
+            } else if let Some(p) = crate::media::path_util::resolve_media_file_on_disk(
+                record_path,
+                Some(library_root),
+                Some(&filename),
+            ) {
+                p.to_string_lossy().to_string()
+            } else {
+                String::new()
+            };
+            if !read_fp.is_empty() {
+                let _ = crate::media::design_source::ensure_source_preview_thumbnails(
+                    &id, &read_fp, &filename, &meta_dir, db_path, filetype, &ext_l,
+                );
+            }
+        }
     }
 
     Ok(id)
@@ -611,27 +717,39 @@ pub fn scan_single_file_minimal_with_conn(
     read_path: &str,
     record_path: &str,
     library_root: &str,
+    generate_micro: bool,
 ) -> Result<String> {
     let file_read_path = std::path::Path::new(read_path);
     let file_record_path = std::path::Path::new(record_path);
     let root_path = std::path::Path::new(library_root);
 
-    let ext = file_record_path.extension().and_then(|e| e.to_str())
-        .ok_or_else(|| anyhow::anyhow!("No extension"))?.to_string();
+    let ext = file_record_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .ok_or_else(|| anyhow::anyhow!("No extension"))?
+        .to_string();
     let filetype = classify_extension(&ext)
         .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", ext))?;
 
     let metadata = std::fs::metadata(file_read_path).context("Failed to read file metadata")?;
     let file_size = metadata.len() as i64;
-    let modified_at = metadata.modified().ok()
+    let modified_at = metadata
+        .modified()
+        .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64).unwrap_or(0);
-    let created_at = metadata.created().ok()
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let created_at = metadata
+        .created()
+        .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64).unwrap_or(modified_at);
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(modified_at);
     let imported_at = Utc::now().timestamp();
 
-    let mime_type = mime_guess::from_path(file_record_path).first().map(|m| m.to_string());
+    let mime_type = mime_guess::from_path(file_record_path)
+        .first()
+        .map(|m| m.to_string());
 
     // 读取原图真实宽高，用于 Masonry 按原始比例预留高度
     // 这里必须记录源图尺寸，而不是缩略图尺寸或近似值。
@@ -643,10 +761,16 @@ pub fn scan_single_file_minimal_with_conn(
         (None, None)
     };
 
-    let filename = file_record_path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    let filename = file_record_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
     let id = uuid::Uuid::new_v4().to_string();
 
-    let source_folder = file_record_path.strip_prefix(root_path).ok()
+    let source_folder = file_record_path
+        .strip_prefix(root_path)
+        .ok()
         .and_then(|p| p.components().next())
         .and_then(|c| c.as_os_str().to_str())
         .filter(|s| !s.is_empty())
@@ -677,16 +801,20 @@ pub fn scan_single_file_minimal_with_conn(
 
     crud::insert_or_restore_media_file(conn, &media_file)?;
 
-    if filetype == "image" {
-        let parent_dir = file_record_path.parent().unwrap_or(std::path::Path::new("."));
+    if generate_micro && filetype == "image" {
+        let parent_dir = file_record_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
         let meta_dir = parent_dir.join(".nocturne_meta");
         std::fs::create_dir_all(&meta_dir).context("Failed to create .nocturne_meta")?;
         let micro_dst = meta_dir.join(format!("{}_micro.webp", filename));
         if !micro_dst.exists() {
             if let Ok(img) = image::open(file_read_path) {
-                let _ = crate::media::thumbnail::generate_micro_thumbnail_from_image(&img, &micro_dst);
+                let _ =
+                    crate::media::thumbnail::generate_micro_thumbnail_from_image(&img, &micro_dst);
             } else {
-                let _ = crate::media::thumbnail::generate_micro_thumbnail(file_read_path, &micro_dst);
+                let _ =
+                    crate::media::thumbnail::generate_micro_thumbnail(file_read_path, &micro_dst);
             }
         }
         if micro_dst.exists() {
@@ -704,6 +832,71 @@ pub fn scan_single_file_minimal_with_conn(
     Ok(id)
 }
 
+/// 库内文件已复制完成后，确保图片 micro 缩略图存在并写入 DB（批量导入 Phase 1 可能只有源路径或目标尚未落盘）。
+pub fn ensure_image_micro_thumbnail_for_file(
+    conn: &rusqlite::Connection,
+    id: &str,
+    filepath: &str,
+) -> Result<()> {
+    let file_path = std::path::Path::new(filepath);
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let filetype = classify_extension(&ext).unwrap_or("document");
+    if filetype != "image" || !file_path.is_file() {
+        return Ok(());
+    }
+
+    let filename = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let meta_dir = file_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join(".nocturne_meta");
+    std::fs::create_dir_all(&meta_dir).context("Failed to create .nocturne_meta")?;
+    let file_size = std::fs::metadata(file_path)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+    let (width, height) = if file_size <= FAST_DIMENSION_MAX_BYTES {
+        image::image_dimensions(file_path)
+            .map(|(w, h)| (Some(w as i32), Some(h as i32)))
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
+    let mut w = width;
+    let mut h = height;
+    let micro_dst = meta_dir.join(format!("{}_micro.webp", filename));
+    if !micro_dst.exists() {
+        if let Ok(img) = image::open(file_path) {
+            w = w.or(Some(img.width() as i32));
+            h = h.or(Some(img.height() as i32));
+            let _ = crate::media::thumbnail::generate_micro_thumbnail_from_image(&img, &micro_dst);
+        } else {
+            let _ = crate::media::thumbnail::generate_micro_thumbnail(file_path, &micro_dst);
+        }
+    }
+    if w.is_some() && h.is_some() {
+        let _ = conn.execute(
+            "UPDATE media_files SET width = COALESCE(width, ?), height = COALESCE(height, ?) WHERE id = ?",
+            rusqlite::params![w, h, id],
+        );
+    }
+    if micro_dst.exists() {
+        crate::media::thumbnail::update_multi_tier_thumbnails(
+            conn,
+            id,
+            Some(&micro_dst.to_string_lossy()),
+            None,
+            None,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
 /// Phase 2：对已有 DB 记录补全 SHA256 + pHash + 缩略图 + 颜色。
 /// 必须在 Phase 1 的 INSERT 完成后调用（id 已存在于 DB）。
 pub fn scan_single_file_enrich(
@@ -713,10 +906,15 @@ pub fn scan_single_file_enrich(
     _library_root: &str,
 ) -> Result<()> {
     let file_path = std::path::Path::new(filepath);
-    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
     let filetype = classify_extension(&ext).unwrap_or("document");
 
-    let meta_dir = file_path.parent()
+    let meta_dir = file_path
+        .parent()
         .unwrap_or(std::path::Path::new("."))
         .join(".nocturne_meta");
 
@@ -725,14 +923,24 @@ pub fn scan_single_file_enrich(
     let mut color_dominant: Option<String> = None;
 
     if filetype == "image" {
-        let filename = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
         let ext_lower = ext.to_lowercase();
 
         if ext_lower == "svg" {
             // SVG 不解码，走老路径（fs::copy）
             let _ = generate_thumbnail_and_meta(
-                id, filepath, &filename, &meta_dir, db_path,
-                &sha256, &phash, &mut color_dominant,
+                id,
+                filepath,
+                &filename,
+                &meta_dir,
+                db_path,
+                &sha256,
+                &phash,
+                &mut color_dominant,
             );
         } else {
             // ── 单读管线 ──
@@ -740,35 +948,66 @@ pub fn scan_single_file_enrich(
             // 4MB PNG 单次解码 1.5s+，单文件 ~5s 纯解码。改为一次解码全部 artifact 共用同一 DynamicImage，
             // 单文件 ~1.5-2s decode，整批吞吐约 3× 提升。
             let _ = enrich_image_single_read(
-                id, filepath, &filename, &meta_dir, db_path,
-                &sha256, phash, &mut color_dominant,
+                id,
+                filepath,
+                &filename,
+                &meta_dir,
+                db_path,
+                &sha256,
+                phash,
+                &mut color_dominant,
             );
         }
     } else if filetype == "video" {
-        let filename = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
         // 视频走原 generate_thumbnail_and_meta（内部委托给 ffmpeg），
         // 然后用 ffmpeg 抽帧得到的 jpg 作为 micro/preview/thumbhash 源（避免再次走视频解码）
         if let Ok(thumb_path) = generate_thumbnail_and_meta(
-            id, filepath, &filename, &meta_dir, db_path,
-            &sha256, &phash, &mut color_dominant,
+            id,
+            filepath,
+            &filename,
+            &meta_dir,
+            db_path,
+            &sha256,
+            &phash,
+            &mut color_dominant,
         ) {
             let src_path = std::path::Path::new(&thumb_path);
-            let meta_dir_path = src_path.parent()
+            let meta_dir_path = src_path
+                .parent()
                 .unwrap_or_else(|| file_path.parent().unwrap_or(std::path::Path::new("")))
                 .to_path_buf();
             let micro_filename = format!("{}_micro.webp", filename);
             let micro_dst = meta_dir_path.join(&micro_filename);
-            let micro_path_opt = crate::media::thumbnail::generate_micro_thumbnail(src_path, &micro_dst)
-                .ok().and_then(|_| micro_dst.exists().then(|| micro_dst.to_string_lossy().to_string()));
+            let micro_path_opt =
+                crate::media::thumbnail::generate_micro_thumbnail(src_path, &micro_dst)
+                    .ok()
+                    .and_then(|_| {
+                        micro_dst
+                            .exists()
+                            .then(|| micro_dst.to_string_lossy().to_string())
+                    });
             let preview_filename = format!("{}_preview.webp", filename);
             let preview_dst = meta_dir_path.join(&preview_filename);
-            let preview_path_opt = crate::media::thumbnail::generate_preview_thumbnail(src_path, &preview_dst)
-                .ok().and_then(|_| preview_dst.exists().then(|| preview_dst.to_string_lossy().to_string()));
+            let preview_path_opt =
+                crate::media::thumbnail::generate_preview_thumbnail(src_path, &preview_dst)
+                    .ok()
+                    .and_then(|_| {
+                        preview_dst
+                            .exists()
+                            .then(|| preview_dst.to_string_lossy().to_string())
+                    });
             let thumbhash_opt = crate::media::thumbnail::generate_thumbhash(src_path)
-                .ok().filter(|h| !h.is_empty());
+                .ok()
+                .filter(|h| !h.is_empty());
             if let Ok(conn2) = open_conn(db_path) {
                 let _ = crate::media::thumbnail::update_multi_tier_thumbnails(
-                    &conn2, id,
+                    &conn2,
+                    id,
                     micro_path_opt.as_deref(),
                     Some(&thumb_path),
                     preview_path_opt.as_deref(),
@@ -776,7 +1015,26 @@ pub fn scan_single_file_enrich(
                 );
             }
         }
-    } else if filetype == "design" && matches!(ext.to_lowercase().as_str(), "psd" | "psb") {
+    } else if filetype == "design" || filetype == "document" {
+        let ext_l = ext.to_lowercase();
+        if crate::media::design_source::needs_source_preview_for_filetype_and_ext(filetype, &ext_l)
+        {
+            let filename = file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let disk = crate::media::path_util::resolve_media_file_on_disk(
+                filepath,
+                Some(_library_root),
+                Some(&filename),
+            )
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| filepath.to_string());
+            let _ = crate::media::design_source::ensure_source_preview_thumbnails(
+                id, &disk, &filename, &meta_dir, db_path, filetype, &ext_l,
+            );
+        }
         if let Ok(conn) = open_conn(db_path) {
             let _ = conn.execute(
                 "UPDATE media_files SET sha256 = ? WHERE id = ?",
@@ -799,16 +1057,29 @@ pub fn scan_single_file_enrich(
         // 1. 尝试读取 .json
         let json_sidecar = file_path.with_extension(format!("{}.json", ext)); // 或者直接 .json
         let alt_json = base_path.with_extension("json");
-        let sidecar_to_check = if json_sidecar.exists() { Some(json_sidecar) } else if alt_json.exists() { Some(alt_json) } else { None };
+        let sidecar_to_check = if json_sidecar.exists() {
+            Some(json_sidecar)
+        } else if alt_json.exists() {
+            Some(alt_json)
+        } else {
+            None
+        };
 
         if let Some(json_path) = sidecar_to_check {
             if let Ok(content) = std::fs::read_to_string(json_path) {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                     let mut tags = Vec::new();
                     if let Some(t_arr) = val.get("tags").and_then(|v| v.as_array()) {
-                        for t in t_arr { if let Some(s) = t.as_str() { tags.push(s.to_string()); } }
+                        for t in t_arr {
+                            if let Some(s) = t.as_str() {
+                                tags.push(s.to_string());
+                            }
+                        }
                     }
-                    let prompt = val.get("prompt").and_then(|v| v.as_str()).or_else(|| val.get("description").and_then(|v| v.as_str()));
+                    let prompt = val
+                        .get("prompt")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| val.get("description").and_then(|v| v.as_str()));
 
                     if !tags.is_empty() {
                         let _ = crate::db::crud::add_media_tags(&conn, id, &tags);
@@ -838,7 +1109,12 @@ pub fn scan_single_file_enrich(
 /// 扫描单个文件并导入数据库（用于外部拖入/粘贴导入）
 /// 不再使用全局 thumbs_dir，缩略图存入各素材所在目录的 .nocturne_meta/
 /// library_root: 库根目录路径，用于提取 source_folder
-pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, library_root: &str) -> Result<()> {
+pub fn scan_single_file(
+    filepath: &str,
+    db_path: &str,
+    _thumbs_dir: &str,
+    library_root: &str,
+) -> Result<()> {
     eprintln!("[scanner] scan_single_file: {}", filepath);
 
     let conn = open_conn(db_path).context("Failed to open DB in scan_single_file")?;
@@ -858,8 +1134,7 @@ pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, librar
     };
 
     // 读取文件系统元数据
-    let metadata = std::fs::metadata(file_path)
-        .context("Failed to read file metadata")?;
+    let metadata = std::fs::metadata(file_path).context("Failed to read file metadata")?;
 
     let file_size = metadata.len() as i64;
 
@@ -916,36 +1191,48 @@ pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, librar
         .map(|s| s.to_string());
 
     // ── 尝试读取已有的 .nocturne_meta/{filename}.json ──
-    let meta_dir = file_path.parent()
+    let meta_dir = file_path
+        .parent()
         .unwrap_or(std::path::Path::new("."))
         .join(".nocturne_meta");
     // 读取 JSON（优先新格式，自动迁移旧格式），验证完整性
     let loaded_meta: Option<crate::models::FileMetaJSON> =
-        load_and_migrate_meta_json(file_path, &meta_dir, &filename_for_log)
-            .and_then(|meta| {
-                let thumb_abs_check = file_path.parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join(&meta.thumbnail);
-                let has_thumbnail = !meta.thumbnail.is_empty() && thumb_abs_check.exists();
-                let has_colors = meta.color_dominant.as_deref().map_or(false, |c| !c.is_empty());
-                // 视频文件不含颜色数据，只要缩略图存在即视为元数据完整
-                if has_thumbnail && (has_colors || filetype == "video") {
-                    eprintln!("[scanner] JSON meta complete for {}", filename_for_log);
-                    Some(meta)
-                } else {
-                    eprintln!("[scanner] JSON meta incomplete for {} (thumb_exists={}, has_colors={})",
-                        filename_for_log, has_thumbnail, has_colors);
-                    None
-                }
-            });
+        load_and_migrate_meta_json(file_path, &meta_dir, &filename_for_log).and_then(|meta| {
+            let thumb_abs_check = file_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join(&meta.thumbnail);
+            let has_thumbnail = !meta.thumbnail.is_empty() && thumb_abs_check.exists();
+            let has_colors = meta
+                .color_dominant
+                .as_deref()
+                .is_some_and(|c| !c.is_empty());
+            // 视频文件不含颜色数据，只要缩略图存在即视为元数据完整
+            if has_thumbnail && (has_colors || filetype == "video") {
+                eprintln!("[scanner] JSON meta complete for {}", filename_for_log);
+                Some(meta)
+            } else {
+                eprintln!(
+                    "[scanner] JSON meta incomplete for {} (thumb_exists={}, has_colors={})",
+                    filename_for_log, has_thumbnail, has_colors
+                );
+                None
+            }
+        });
 
     let (sha256, phash, thumbnail_path, color_dominant) = if let Some(ref meta) = loaded_meta {
-        let thumb_abs = file_path.parent()
+        let thumb_abs = file_path
+            .parent()
             .unwrap_or(std::path::Path::new("."))
             .join(&meta.thumbnail)
             .to_string_lossy()
             .to_string();
-        (meta.sha256.clone(), meta.phash, Some(thumb_abs), meta.color_dominant.clone())
+        (
+            meta.sha256.clone(),
+            meta.phash,
+            Some(thumb_abs),
+            meta.color_dominant.clone(),
+        )
     } else {
         let (sha, ph) = compute_hashes(filepath, filetype);
         (sha, ph, None, None)
@@ -990,13 +1277,19 @@ pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, librar
                 Some(micro_dst.to_string_lossy().to_string())
             } else {
                 // 优先从 EXIF 提取嵌入缩略图（不解码原图，<1ms）
-                crate::media::thumbnail::generate_micro_from_embedded_thumbnail(filepath, &micro_dst)
-                    .or_else(|| {
-                        // 嵌入缩略图不可用→回退到标准 micro 生成
-                        crate::media::thumbnail::generate_micro_thumbnail(src_path, &micro_dst)
-                            .ok()
-                            .and_then(|_| micro_dst.exists().then(|| micro_dst.to_string_lossy().to_string()))
-                    })
+                crate::media::thumbnail::generate_micro_from_embedded_thumbnail(
+                    filepath, &micro_dst,
+                )
+                .or_else(|| {
+                    // 嵌入缩略图不可用→回退到标准 micro 生成
+                    crate::media::thumbnail::generate_micro_thumbnail(src_path, &micro_dst)
+                        .ok()
+                        .and_then(|_| {
+                            micro_dst
+                                .exists()
+                                .then(|| micro_dst.to_string_lossy().to_string())
+                        })
+                })
             };
             let preview_filename = format!("{}_preview.webp", filename_for_log);
             let preview_dst = meta_dir.join(&preview_filename);
@@ -1005,7 +1298,11 @@ pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, librar
             } else {
                 crate::media::thumbnail::generate_preview_thumbnail(src_path, &preview_dst)
                     .ok()
-                    .and_then(|_| preview_dst.exists().then(|| preview_dst.to_string_lossy().to_string()))
+                    .and_then(|_| {
+                        preview_dst
+                            .exists()
+                            .then(|| preview_dst.to_string_lossy().to_string())
+                    })
             };
 
             // thumbhash 始终生成，不依赖 micro 成功与否
@@ -1020,7 +1317,11 @@ pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, librar
                     preview_path_opt.as_deref(),
                     thumbhash_opt.as_deref(),
                 ) {
-                    log::warn!("[scanner] Failed to update micro/preview/thumbhash for restored '{}': {}", filename_for_log, e);
+                    log::warn!(
+                        "[scanner] Failed to update micro/preview/thumbhash for restored '{}': {}",
+                        filename_for_log,
+                        e
+                    );
                 }
             }
         }
@@ -1029,7 +1330,10 @@ pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, librar
         if let Some(ref tags) = meta.tags {
             if !tags.is_empty() {
                 if let Err(e) = crud::update_media_tags(&conn, &media_file.id, tags) {
-                    eprintln!("[scanner] Failed to write tags for {}: {}", filename_for_log, e);
+                    eprintln!(
+                        "[scanner] Failed to write tags for {}: {}",
+                        filename_for_log, e
+                    );
                 }
             }
         }
@@ -1038,7 +1342,10 @@ pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, librar
         if let Some(ref prompt) = meta.prompt_text {
             if !prompt.is_empty() {
                 if let Err(e) = crud::upsert_ai_metadata(&conn, &media_file.id, prompt, "", "") {
-                    eprintln!("[scanner] Failed to write ai_metadata for {}: {}", filename_for_log, e);
+                    eprintln!(
+                        "[scanner] Failed to write ai_metadata for {}: {}",
+                        filename_for_log, e
+                    );
                 }
             }
         }
@@ -1046,11 +1353,20 @@ pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, librar
         // ── 正常导入路径：INSERT OR IGNORE + 完整处理流程 ──
         match crud::insert_or_restore_media_file(&conn, &media_file) {
             Ok(true) => {
-                eprintln!("[scanner] {}: {}",
-                    if media_file.is_trashed { "Restored from trash" } else { "Imported" },
-                    filename_for_log);
+                eprintln!(
+                    "[scanner] {}: {}",
+                    if media_file.is_trashed {
+                        "Restored from trash"
+                    } else {
+                        "Imported"
+                    },
+                    filename_for_log
+                );
                 if filetype == "image" || filetype == "video" {
-                    eprintln!("[scanner] Processing {} (full pipeline): {}", filetype, filename_for_log);
+                    eprintln!(
+                        "[scanner] Processing {} (full pipeline): {}",
+                        filetype, filename_for_log
+                    );
                     let id_for_thumb = media_file.id.clone();
                     let filepath_for_thumb = media_file.filepath.clone();
                     match generate_thumbnail_and_meta(
@@ -1068,14 +1384,25 @@ pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, librar
 
                             // ── v5.8: 生成 micro + thumbhash（同步，不生成 preview） ──
                             let src_path = std::path::Path::new(&filepath_for_thumb);
-                            let meta_dir_path = std::path::Path::new(&thumb_path).parent()
-                                .unwrap_or_else(|| src_path.parent().unwrap_or(std::path::Path::new(""))).to_path_buf();
+                            let meta_dir_path = std::path::Path::new(&thumb_path)
+                                .parent()
+                                .unwrap_or_else(|| {
+                                    src_path.parent().unwrap_or(std::path::Path::new(""))
+                                })
+                                .to_path_buf();
 
                             // Micro thumbnail
                             let micro_filename = format!("{}_micro.webp", filename_for_log);
                             let micro_dst = meta_dir_path.join(&micro_filename);
-                            let micro_path_opt = if let Err(e) = crate::media::thumbnail::generate_micro_thumbnail(src_path, &micro_dst) {
-                                log::warn!("[scanner] Micro thumbnail generation failed for '{}': {}", filename_for_log, e);
+                            let micro_path_opt = if let Err(e) =
+                                crate::media::thumbnail::generate_micro_thumbnail(
+                                    src_path, &micro_dst,
+                                ) {
+                                log::warn!(
+                                    "[scanner] Micro thumbnail generation failed for '{}': {}",
+                                    filename_for_log,
+                                    e
+                                );
                                 None
                             } else if micro_dst.exists() {
                                 Some(micro_dst.to_string_lossy().to_string())
@@ -1084,14 +1411,19 @@ pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, librar
                             };
 
                             // ThumbHash
-                            let thumbhash_opt = match crate::media::thumbnail::generate_thumbhash(src_path) {
-                                Ok(hash) if !hash.is_empty() => Some(hash),
-                                Ok(_) => None,
-                                Err(e) => {
-                                    log::warn!("[scanner] ThumbHash generation failed for '{}': {}", filename_for_log, e);
-                                    None
-                                }
-                            };
+                            let thumbhash_opt =
+                                match crate::media::thumbnail::generate_thumbhash(src_path) {
+                                    Ok(hash) if !hash.is_empty() => Some(hash),
+                                    Ok(_) => None,
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[scanner] ThumbHash generation failed for '{}': {}",
+                                            filename_for_log,
+                                            e
+                                        );
+                                        None
+                                    }
+                                };
 
                             // 更新 DB 多档路径
                             if micro_path_opt.is_some() || thumbhash_opt.is_some() {
@@ -1106,7 +1438,7 @@ pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, librar
                                     );
                                 }
                             }
-                        },
+                        }
                         Err(e) => {
                             // 缩略图生成失败：DB 记录已存在且 thumbnail_path = NULL。
                             // 下次扫描时 load_and_migrate_meta_json 会因 .json 缺失
@@ -1117,10 +1449,13 @@ pub fn scan_single_file(filepath: &str, db_path: &str, _thumbs_dir: &str, librar
                         }
                     }
                 }
-            },
+            }
             Ok(false) => {
-                eprintln!("[scanner] File already exists, skipping: {}", filename_for_log);
-            },
+                eprintln!(
+                    "[scanner] File already exists, skipping: {}",
+                    filename_for_log
+                );
+            }
             Err(e) => {
                 return Err(e).context("Failed to insert file");
             }
@@ -1233,12 +1568,20 @@ where
                         "UPDATE media_files SET source_folder = ? WHERE filepath = ?",
                         rusqlite::params![c, filepath],
                     ) {
-                        log::warn!("[scanner] Failed to update source_folder for '{}': {}", filename, e);
+                        log::warn!(
+                            "[scanner] Failed to update source_folder for '{}': {}",
+                            filename,
+                            e
+                        );
                     }
                 }
             }
             Err(e) => {
-                log::warn!("[scanner] scan_imported_files: failed for '{}': {}", filename, e);
+                log::warn!(
+                    "[scanner] scan_imported_files: failed for '{}': {}",
+                    filename,
+                    e
+                );
                 skipped_count += 1;
             }
         }
@@ -1263,9 +1606,11 @@ fn compute_hashes(filepath: &str, filetype: &str) -> (Option<String>, Option<i64
     } else {
         None
     };
-    eprintln!("[scanner] Hashes computed for: sha256={}, phash={}",
+    eprintln!(
+        "[scanner] Hashes computed for: sha256={}, phash={}",
         sha.as_deref().unwrap_or("failed"),
-        ph.map_or("not_applicable".to_string(), |p| p.to_string()));
+        ph.map_or("not_applicable".to_string(), |p| p.to_string())
+    );
     (sha, ph)
 }
 
@@ -1308,7 +1653,10 @@ fn load_and_migrate_meta_json(
         return None;
     }
 
-    eprintln!("[scanner] Old-format JSON found for {}, migrating...", filename);
+    eprintln!(
+        "[scanner] Old-format JSON found for {}, migrating...",
+        filename
+    );
 
     let mut meta = match read_meta_json(&old_json_path) {
         Ok(m) => m,
@@ -1320,7 +1668,8 @@ fn load_and_migrate_meta_json(
 
     // 迁移缩略图：{file_stem}_thumb.jpg → {filename}_thumb.jpg
     let new_thumb_rel = format!(".nocturne_meta/{}_thumb.jpg", filename);
-    let old_thumb_abs = file_path.parent()
+    let old_thumb_abs = file_path
+        .parent()
         .unwrap_or(std::path::Path::new("."))
         .join(format!(".nocturne_meta/{}_thumb.jpg", file_stem));
     let new_thumb_abs = meta_dir.join(format!("{}_thumb.jpg", filename));
@@ -1347,18 +1696,24 @@ fn load_and_migrate_meta_json(
 
     // 删除旧 JSON
     let _ = std::fs::remove_file(&old_json_path);
-    eprintln!("[scanner] Migration complete: {} → {}.json", file_stem, filename);
+    eprintln!(
+        "[scanner] Migration complete: {} → {}.json",
+        file_stem, filename
+    );
 
     Some(meta)
 }
 
 /// 写入 .nocturne_meta/{filename}.json 元数据文件
 fn write_meta_json(meta_dir: &std::path::Path, filename: &str, meta: &FileMetaJSON) -> Result<()> {
-    std::fs::create_dir_all(meta_dir)
-        .with_context(|| format!("Failed to create .nocturne_meta directory: {}", meta_dir.display()))?;
+    std::fs::create_dir_all(meta_dir).with_context(|| {
+        format!(
+            "Failed to create .nocturne_meta directory: {}",
+            meta_dir.display()
+        )
+    })?;
     let json_path = meta_dir.join(format!("{}.json", filename));
-    let content = serde_json::to_string_pretty(meta)
-        .context("Failed to serialize meta JSON")?;
+    let content = serde_json::to_string_pretty(meta).context("Failed to serialize meta JSON")?;
     std::fs::write(&json_path, content)
         .with_context(|| format!("Failed to write meta JSON: {}", json_path.display()))?;
     Ok(())
@@ -1372,6 +1727,7 @@ fn write_meta_json(meta_dir: &std::path::Path, filename: &str, meta: &FileMetaJS
 ///   - 解码次数：3 次 → 1 次
 ///   - 主缩略图缩放：Lanczos3 → DynamicImage::thumbnail（更快）
 ///   - DB 更新：3 次 → 1 次（update_multi_tier_thumbnails 单次写入）
+#[allow(clippy::too_many_arguments)]
 fn enrich_image_single_read(
     id: &str,
     filepath: &str,
@@ -1382,12 +1738,16 @@ fn enrich_image_single_read(
     phash: Option<i64>,
     color_dominant: &mut Option<String>,
 ) -> Result<()> {
-    std::fs::create_dir_all(meta_dir)
-        .with_context(|| format!("Failed to create .nocturne_meta directory: {}", meta_dir.display()))?;
+    std::fs::create_dir_all(meta_dir).with_context(|| {
+        format!(
+            "Failed to create .nocturne_meta directory: {}",
+            meta_dir.display()
+        )
+    })?;
 
     // 一次性解码原图
-    let img = image::open(filepath)
-        .with_context(|| format!("Failed to open image: {}", filepath))?;
+    let img =
+        image::open(filepath).with_context(|| format!("Failed to open image: {}", filepath))?;
 
     // 1) 主缩略图 800px JPEG Q90（用 thumbnail() 而非 Lanczos3 resize，~2× 更快）
     let thumb_filename = format!("{}_thumb.jpg", filename);
@@ -1405,7 +1765,11 @@ fn enrich_image_single_read(
             }
         }
         Err(e) => {
-            log::warn!("[enrich] Failed to create main thumbnail file for {}: {}", filename, e);
+            log::warn!(
+                "[enrich] Failed to create main thumbnail file for {}: {}",
+                filename,
+                e
+            );
             None
         }
     };
@@ -1414,12 +1778,19 @@ fn enrich_image_single_read(
     // 2) Micro 256px WebP Q70（共享同一 img）
     let micro_filename = format!("{}_micro.webp", filename);
     let micro_dst = meta_dir.join(&micro_filename);
-    let micro_path_str = crate::media::thumbnail::generate_micro_thumbnail_from_image(&img, &micro_dst)
-        .ok().and_then(|_| micro_dst.exists().then(|| micro_dst.to_string_lossy().to_string()));
+    let micro_path_str =
+        crate::media::thumbnail::generate_micro_thumbnail_from_image(&img, &micro_dst)
+            .ok()
+            .and_then(|_| {
+                micro_dst
+                    .exists()
+                    .then(|| micro_dst.to_string_lossy().to_string())
+            });
 
     // 3) Thumbhash（共享同一 img）
     let thumbhash_str = crate::media::thumbnail::generate_thumbhash_from_image(&img)
-        .ok().filter(|h| !h.is_empty());
+        .ok()
+        .filter(|h| !h.is_empty());
 
     // 4) 主色调（共享同一 img）
     if color_dominant.is_none() || color_dominant.as_deref().unwrap_or_default().is_empty() {
@@ -1430,8 +1801,14 @@ fn enrich_image_single_read(
     // 5) Preview 2048px WebP（共享同一 img）
     let preview_filename = format!("{}_preview.webp", filename);
     let preview_dst = meta_dir.join(&preview_filename);
-    let preview_path_str = crate::media::thumbnail::generate_preview_thumbnail_from_image(&img, &preview_dst)
-        .ok().and_then(|_| preview_dst.exists().then(|| preview_dst.to_string_lossy().to_string()));
+    let preview_path_str =
+        crate::media::thumbnail::generate_preview_thumbnail_from_image(&img, &preview_dst)
+            .ok()
+            .and_then(|_| {
+                preview_dst
+                    .exists()
+                    .then(|| preview_dst.to_string_lossy().to_string())
+            });
 
     // 6) 主色调（共享同一 img）
     if color_dominant.is_none() || color_dominant.as_deref().unwrap_or_default().is_empty() {
@@ -1442,7 +1819,8 @@ fn enrich_image_single_read(
     // 7) DB 一次性写入所有缩略图档位
     if let Ok(conn) = open_conn(db_path) {
         let _ = crate::media::thumbnail::update_multi_tier_thumbnails(
-            &conn, id,
+            &conn,
+            id,
             micro_path_str.as_deref(),
             main_path_str.as_deref(),
             preview_path_str.as_deref(),
@@ -1473,6 +1851,7 @@ fn enrich_image_single_read(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_thumbnail_and_meta(
     media_id: &str,
     filepath: &str,
@@ -1484,8 +1863,12 @@ fn generate_thumbnail_and_meta(
     color_dominant: &mut Option<String>,
 ) -> Result<String> {
     // 确保 .nocturne_meta 目录存在
-    std::fs::create_dir_all(meta_dir)
-        .with_context(|| format!("Failed to create .nocturne_meta directory: {}", meta_dir.display()))?;
+    std::fs::create_dir_all(meta_dir).with_context(|| {
+        format!(
+            "Failed to create .nocturne_meta directory: {}",
+            meta_dir.display()
+        )
+    })?;
 
     // 缩略图文件名：{filename}_thumb.jpg
     let thumb_filename = format!("{}_thumb.jpg", filename);
@@ -1500,21 +1883,26 @@ fn generate_thumbnail_and_meta(
     if matches!(ext.as_deref(), Some("svg")) {
         // SVG 直接复制
         std::fs::copy(filepath, &thumb_path)
-            .with_context(|| format!("Failed to copy SVG thumbnail"))?;
-    } else if matches!(ext.as_deref(), Some("mp4") | Some("mov") | Some("avi") | Some("mkv") | Some("webm")) {
+            .with_context(|| "Failed to copy SVG thumbnail".to_string())?;
+    } else if matches!(
+        ext.as_deref(),
+        Some("mp4") | Some("mov") | Some("avi") | Some("mkv") | Some("webm")
+    ) {
         // 视频：用 ffmpeg 提取第一帧（generate_video_thumbnail 内部写 DB + JSON，直接返回）
         return crate::media::thumbnail::generate_video_thumbnail(media_id, filepath, db_path);
     } else {
         // 使用 image crate 生成缩略图
-        let img = image::open(filepath)
-            .with_context(|| format!("Failed to open image: {}", filepath))?;
+        let img =
+            image::open(filepath).with_context(|| format!("Failed to open image: {}", filepath))?;
         let thumb = img.resize(800, 800, image::imageops::FilterType::Lanczos3);
 
-        let output_file = std::fs::File::create(&thumb_path)
-            .with_context(|| format!("Failed to create thumbnail file: {}", thumb_path.display()))?;
+        let output_file = std::fs::File::create(&thumb_path).with_context(|| {
+            format!("Failed to create thumbnail file: {}", thumb_path.display())
+        })?;
         let mut buf_writer = std::io::BufWriter::new(output_file);
         let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf_writer, 90);
-        thumb.write_with_encoder(encoder)
+        thumb
+            .write_with_encoder(encoder)
             .with_context(|| format!("Failed to save thumbnail: {}", thumb_path.display()))?;
 
         // 提取主色调（如果未从已有 JSON 中读取到）
@@ -1588,8 +1976,7 @@ pub fn scan_single_file_with_conn(
     };
 
     // 读取文件系统元数据
-    let metadata = std::fs::metadata(file_path)
-        .context("Failed to read file metadata")?;
+    let metadata = std::fs::metadata(file_path).context("Failed to read file metadata")?;
 
     let file_size = metadata.len() as i64;
     let modified_at = metadata
@@ -1606,7 +1993,9 @@ pub fn scan_single_file_with_conn(
         .unwrap_or(modified_at);
     let imported_at = Utc::now().timestamp();
 
-    let mime_type = mime_guess::from_path(file_path).first().map(|m| m.to_string());
+    let mime_type = mime_guess::from_path(file_path)
+        .first()
+        .map(|m| m.to_string());
 
     let (width, height) = if filetype == "image" && file_size <= FAST_DIMENSION_MAX_BYTES {
         match image::image_dimensions(file_path) {
@@ -1617,7 +2006,11 @@ pub fn scan_single_file_with_conn(
         (None, None)
     };
 
-    let filename = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    let filename = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
     let filename_for_log = filename.clone();
 
     // 提取来源文件夹名
@@ -1630,36 +2023,48 @@ pub fn scan_single_file_with_conn(
         .map(|s| s.to_string());
 
     // ── 尝试读取已有的 .nocturne_meta/{filename}.json ──
-    let meta_dir = file_path.parent()
+    let meta_dir = file_path
+        .parent()
         .unwrap_or(std::path::Path::new("."))
         .join(".nocturne_meta");
     // 读取 JSON（优先新格式，自动迁移旧格式），验证完整性
     let loaded_meta: Option<crate::models::FileMetaJSON> =
-        load_and_migrate_meta_json(file_path, &meta_dir, &filename_for_log)
-            .and_then(|meta| {
-                let thumb_abs_check = file_path.parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join(&meta.thumbnail);
-                let has_thumbnail = !meta.thumbnail.is_empty() && thumb_abs_check.exists();
-                let has_colors = meta.color_dominant.as_deref().map_or(false, |c| !c.is_empty());
-                // 视频文件不含颜色数据，只要缩略图存在即视为元数据完整
-                if has_thumbnail && (has_colors || filetype == "video") {
-                    eprintln!("[scanner] JSON meta complete for {}", filename_for_log);
-                    Some(meta)
-                } else {
-                    eprintln!("[scanner] JSON meta incomplete for {} (thumb_exists={}, has_colors={})",
-                        filename_for_log, has_thumbnail, has_colors);
-                    None
-                }
-            });
+        load_and_migrate_meta_json(file_path, &meta_dir, &filename_for_log).and_then(|meta| {
+            let thumb_abs_check = file_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join(&meta.thumbnail);
+            let has_thumbnail = !meta.thumbnail.is_empty() && thumb_abs_check.exists();
+            let has_colors = meta
+                .color_dominant
+                .as_deref()
+                .is_some_and(|c| !c.is_empty());
+            // 视频文件不含颜色数据，只要缩略图存在即视为元数据完整
+            if has_thumbnail && (has_colors || filetype == "video") {
+                eprintln!("[scanner] JSON meta complete for {}", filename_for_log);
+                Some(meta)
+            } else {
+                eprintln!(
+                    "[scanner] JSON meta incomplete for {} (thumb_exists={}, has_colors={})",
+                    filename_for_log, has_thumbnail, has_colors
+                );
+                None
+            }
+        });
 
     let (sha256, phash, thumbnail_path, color_dominant) = if let Some(ref meta) = loaded_meta {
-        let thumb_abs = file_path.parent()
+        let thumb_abs = file_path
+            .parent()
             .unwrap_or(std::path::Path::new("."))
             .join(&meta.thumbnail)
             .to_string_lossy()
             .to_string();
-        (meta.sha256.clone(), meta.phash, Some(thumb_abs), meta.color_dominant.clone())
+        (
+            meta.sha256.clone(),
+            meta.phash,
+            Some(thumb_abs),
+            meta.color_dominant.clone(),
+        )
     } else {
         let (sha, ph) = compute_hashes(filepath, filetype);
         (sha, ph, None, None)
@@ -1700,7 +2105,10 @@ pub fn scan_single_file_with_conn(
         if let Some(ref tags) = meta.tags {
             if !tags.is_empty() {
                 if let Err(e) = crud::update_media_tags(conn, &media_file.id, tags) {
-                    eprintln!("[scanner] Failed to write tags for {}: {}", filename_for_log, e);
+                    eprintln!(
+                        "[scanner] Failed to write tags for {}: {}",
+                        filename_for_log, e
+                    );
                 }
             }
         }
@@ -1709,7 +2117,10 @@ pub fn scan_single_file_with_conn(
         if let Some(ref prompt) = meta.prompt_text {
             if !prompt.is_empty() {
                 if let Err(e) = crud::upsert_ai_metadata(conn, &media_file.id, prompt, "", "") {
-                    eprintln!("[scanner] Failed to write ai_metadata for {}: {}", filename_for_log, e);
+                    eprintln!(
+                        "[scanner] Failed to write ai_metadata for {}: {}",
+                        filename_for_log, e
+                    );
                 }
             }
         }
@@ -1717,9 +2128,20 @@ pub fn scan_single_file_with_conn(
         // ── 正常导入路径：INSERT OR IGNORE + 完整处理流程 ──
         match crud::insert_or_restore_media_file(conn, &media_file) {
             Ok(true) => {
-                eprintln!("[scanner] {}: {}", if media_file.is_trashed { "Restored from trash" } else { "Imported" }, filename_for_log);
+                eprintln!(
+                    "[scanner] {}: {}",
+                    if media_file.is_trashed {
+                        "Restored from trash"
+                    } else {
+                        "Imported"
+                    },
+                    filename_for_log
+                );
                 if filetype == "image" || filetype == "video" {
-                    eprintln!("[scanner] Processing {} (full pipeline): {}", filetype, filename_for_log);
+                    eprintln!(
+                        "[scanner] Processing {} (full pipeline): {}",
+                        filetype, filename_for_log
+                    );
                     let id_for_thumb = media_file.id.clone();
                     let filepath_for_thumb = media_file.filepath.clone();
                     match generate_thumbnail_and_meta(
@@ -1737,14 +2159,25 @@ pub fn scan_single_file_with_conn(
 
                             // ── v5.8: 生成 micro + thumbhash（同步，不生成 preview） ──
                             let src_path = std::path::Path::new(&filepath_for_thumb);
-                            let meta_dir_path = std::path::Path::new(&thumb_path).parent()
-                                .unwrap_or_else(|| src_path.parent().unwrap_or(std::path::Path::new(""))).to_path_buf();
+                            let meta_dir_path = std::path::Path::new(&thumb_path)
+                                .parent()
+                                .unwrap_or_else(|| {
+                                    src_path.parent().unwrap_or(std::path::Path::new(""))
+                                })
+                                .to_path_buf();
 
                             // Micro thumbnail
                             let micro_filename = format!("{}_micro.webp", filename_for_log);
                             let micro_dst = meta_dir_path.join(&micro_filename);
-                            let micro_path_opt = if let Err(e) = crate::media::thumbnail::generate_micro_thumbnail(src_path, &micro_dst) {
-                                log::warn!("[scanner] Micro thumbnail generation failed for '{}': {}", filename_for_log, e);
+                            let micro_path_opt = if let Err(e) =
+                                crate::media::thumbnail::generate_micro_thumbnail(
+                                    src_path, &micro_dst,
+                                ) {
+                                log::warn!(
+                                    "[scanner] Micro thumbnail generation failed for '{}': {}",
+                                    filename_for_log,
+                                    e
+                                );
                                 None
                             } else if micro_dst.exists() {
                                 Some(micro_dst.to_string_lossy().to_string())
@@ -1753,14 +2186,19 @@ pub fn scan_single_file_with_conn(
                             };
 
                             // ThumbHash
-                            let thumbhash_opt = match crate::media::thumbnail::generate_thumbhash(src_path) {
-                                Ok(hash) if !hash.is_empty() => Some(hash),
-                                Ok(_) => None,
-                                Err(e) => {
-                                    log::warn!("[scanner] ThumbHash generation failed for '{}': {}", filename_for_log, e);
-                                    None
-                                }
-                            };
+                            let thumbhash_opt =
+                                match crate::media::thumbnail::generate_thumbhash(src_path) {
+                                    Ok(hash) if !hash.is_empty() => Some(hash),
+                                    Ok(_) => None,
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[scanner] ThumbHash generation failed for '{}': {}",
+                                            filename_for_log,
+                                            e
+                                        );
+                                        None
+                                    }
+                                };
 
                             // 更新 DB 多档路径（conn 已存在，直接用 crud）
                             if micro_path_opt.is_some() || thumbhash_opt.is_some() {
@@ -1773,7 +2211,7 @@ pub fn scan_single_file_with_conn(
                                     thumbhash_opt.as_deref(),
                                 );
                             }
-                        },
+                        }
                         Err(e) => {
                             // 缩略图生成失败：DB 记录已存在且 thumbnail_path = NULL。
                             // 下次扫描时 load_and_migrate_meta_json 会因 .json 缺失
@@ -1784,10 +2222,13 @@ pub fn scan_single_file_with_conn(
                         }
                     }
                 }
-            },
+            }
             Ok(false) => {
-                eprintln!("[scanner] File already exists, skipping: {}", filename_for_log);
-            },
+                eprintln!(
+                    "[scanner] File already exists, skipping: {}",
+                    filename_for_log
+                );
+            }
             Err(e) => {
                 return Err(e).context("Failed to insert file");
             }

@@ -1,12 +1,12 @@
 # Privacy
 
-Nocturne Gallery is designed as a local-first desktop application. These notes describe the intended privacy model for the current pre-1.0 project.
+Gega Gallery is designed as a local-first desktop application. These notes describe the intended privacy model for the current pre-1.0 project.
 
 ## Local-First by Default
 
 The app is intended to work without a cloud account. Your media library, grouping state, prompts, preferences, and attachment references are handled through local application storage and local files.
 
-Nocturne Gallery should not upload your media library to a hosted service as part of normal library management.
+Gega Gallery should not upload your media library to a hosted service as part of normal library management.
 
 ## What Stays Local
 
@@ -26,7 +26,7 @@ AI provider integration is optional. External AI requests should only happen whe
 
 When AI integrations are configured, the data sent depends on the provider workflow being used. Treat prompts, selected media context, and generated metadata as potentially shareable with the configured provider. Review your provider settings and API endpoint before using those features.
 
-API keys and provider configuration should be handled carefully on your local machine. Do not publish local settings files or credentials.
+API keys and provider configuration should be handled carefully on your local machine. Do not publish local settings files or credentials. AI features must not silently upload media, prompts, file paths, metadata, API keys, or provider settings, and future AI workflows that send content off-device must make that behavior explicit in the UI and documentation.
 
 ## File Safety Principles
 
@@ -41,7 +41,7 @@ The project follows these file-safety principles:
 
 ## Pre-1.0 Limitations
 
-Nocturne Gallery is still pre-1.0. Packaging, public release artifacts, automated regression tests, and cross-platform polish are still in progress.
+Gega Gallery is still pre-1.0. Packaging, public release artifacts, automated regression tests, and cross-platform polish are still in progress.
 
 Users should expect rough edges during alpha testing, especially around platform-specific file handling, media metadata edge cases, and optional AI provider configuration.
 

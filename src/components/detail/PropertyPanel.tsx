@@ -15,6 +15,8 @@ import { Icon } from '../common/Icon';
 import { ModelCombobox } from './ModelCombobox';
 import type { MediaAttachment, MediaDetail } from '../../types/media';
 import { normalizeTransferredFilePath, pathToFileUri } from '../../utils/filePath';
+import { pickInspectorThumbnailPath } from '../../lib/gridThumbnail';
+import { resolveDisplaySrc } from '../../lib/loadFullResolution';
 
 // ----------------------------------------------------------------
 // Types
@@ -274,6 +276,8 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
   const [batchTagInput, setBatchTagInput] = useState('');
   const [isAddingBatchTag, setIsAddingBatchTag] = useState(false);
   const [previewAttachmentId, setPreviewAttachmentId] = useState<string | null>(null);
+  const [inspectorPreviewDiskPath, setInspectorPreviewDiskPath] = useState<string | null>(null);
+  const [inspectorPreviewFailed, setInspectorPreviewFailed] = useState(false);
   const [selectedAttachmentId, setSelectedAttachmentId] = useState<string | null>(null);
   const [isAttachmentDragOver, setIsAttachmentDragOver] = useState(false);
   const [attachmentPreviewMap, setAttachmentPreviewMap] = useState<Record<string, string>>({});
@@ -561,15 +565,6 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
     catch { return []; }
   }, [detail?.file.colorDominant]);
 
-  const detailPreviewSrc = useMemo(() => {
-    if (!detail) return null;
-    const previewPath = detail.file.thumbnailPreviewPath || detail.file.thumbnailPath;
-    if (previewPath) return convertFileSrc(previewPath);
-    if (detail.file.fileSize <= MAX_INLINE_ORIGINAL_PREVIEW_BYTES && canPreviewOriginalImage(detail.file.filename))
-      return convertFileSrc(detail.file.filepath);
-    return null;
-  }, [detail]);
-
   const canvasActiveAttachmentId = useMemo(() => {
     if (!canvasAttachmentPreview || canvasAttachmentPreview.ownerMediaId !== inspectorMediaId) return null;
     return canvasAttachmentPreview.activeId ?? canvasAttachmentPreview.items[0]?.id ?? null;
@@ -601,6 +596,56 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
       ? convertFileSrc(inspectorAttachment.filepath)
       : (attachmentPreviewMap[inspectorAttachment.id] ?? null);
   }, [attachmentPreviewMap, inspectorAttachment, isDirectAttachmentPreview]);
+
+  useEffect(() => {
+    setInspectorPreviewFailed(false);
+    if (inspectorAttachment) {
+      setInspectorPreviewDiskPath(null);
+      return;
+    }
+    if (!detail) {
+      setInspectorPreviewDiskPath(null);
+      return;
+    }
+    const diskPath = pickInspectorThumbnailPath(detail.file);
+    if (diskPath) {
+      setInspectorPreviewDiskPath(diskPath);
+      return;
+    }
+    if (
+      detail.file.fileSize <= MAX_INLINE_ORIGINAL_PREVIEW_BYTES
+      && canPreviewOriginalImage(detail.file.filename)
+    ) {
+      setInspectorPreviewDiskPath(detail.file.filepath);
+      return;
+    }
+    setInspectorPreviewDiskPath(null);
+  }, [
+    detail,
+    inspectorAttachment,
+    detail?.file.id,
+    detail?.file.filepath,
+    detail?.file.thumbnailMicroPath,
+    detail?.file.thumbnailPath,
+    detail?.file.thumbnailPreviewPath,
+    detail?.file.fileSize,
+    detail?.file.filename,
+  ]);
+
+  const handleInspectorPreviewError = useCallback(() => {
+    if (!detail || inspectorAttachment) return;
+    const filepath = detail.file.filepath?.trim();
+    if (
+      filepath
+      && inspectorPreviewDiskPath !== filepath
+      && (detail.file.filetype === 'image' || detail.file.filetype === 'video')
+    ) {
+      setInspectorPreviewDiskPath(filepath);
+      setInspectorPreviewFailed(false);
+      return;
+    }
+    setInspectorPreviewFailed(true);
+  }, [detail, inspectorAttachment, inspectorPreviewDiskPath]);
 
   const activePreviewAttachment = useMemo(
     () => detail?.attachments.find((attachment) => attachment.id === previewAttachmentId) ?? null,
@@ -635,7 +680,11 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
 
   // Display values
   const inspectorDisplayName = inspectorAttachment?.filename ?? detail?.file.filename ?? '';
-  const inspectorDisplayPreviewSrc = inspectorAttachmentPreviewSrc ?? detailPreviewSrc;
+  const inspectorDisplayPreviewSrc = inspectorAttachment
+    ? inspectorAttachmentPreviewSrc
+    : (inspectorPreviewDiskPath && !inspectorPreviewFailed
+      ? resolveDisplaySrc(inspectorPreviewDiskPath)
+      : null);
   const inspectorDisplayPath = inspectorAttachment?.filepath ?? detail?.file.filepath ?? '';
   const inspectorDisplayFormat = inspectorDisplayName.includes('.')
     ? inspectorDisplayName.split('.').pop()!.toUpperCase()
@@ -816,12 +865,12 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
     if (!confirmed) return;
     const selectedIdsArray = Array.from(selectedIdsRef.current);
     try {
-      const result = await invoke<{ succeeded: number; failed: number }>('batch_move_to_trash', { ids: selectedIdsArray });
+      const result = await invoke<{ succeeded: number; failed: number; first_error?: string | null }>('batch_move_to_trash', { ids: selectedIdsArray });
       if (result.succeeded > 0) {
         showToast(result.failed > 0 ? `已将 ${result.succeeded} 张图片移入回收站，失败 ${result.failed} 张` : `已将 ${result.succeeded} 张图片移入回收站`);
         deselectAll(); fetchFiles(1);
         window.dispatchEvent(new CustomEvent('trash-updated'));
-      } else { showToast('批量移入回收站失败'); }
+      } else { showToast(result.first_error?.trim() || '批量移入回收站失败'); }
     } catch { showToast('批量移入回收站失败'); }
   };
 
@@ -857,7 +906,13 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
     <>
       <div style={{ position: 'relative', width: '100%', height: '228px', background: 'linear-gradient(180deg, color-mix(in srgb, var(--bg-card) 88%, transparent) 0%, color-mix(in srgb, var(--bg-primary) 84%, transparent) 100%)', borderRadius: '18px', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, boxShadow: 'inset 0 0 0 1px var(--border)' }}>
         {inspectorDisplayPreviewSrc ? (
-          <img src={inspectorDisplayPreviewSrc} alt={inspectorDisplayName} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+          <img
+            src={inspectorDisplayPreviewSrc}
+            alt={inspectorDisplayName}
+            decoding="async"
+            onError={handleInspectorPreviewError}
+            style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+          />
         ) : !inspectorAttachment && isVideoFile(detail.file.filename) ? (
           <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '8px', backgroundColor: 'var(--bg-hover)' }}>
             <Icon name="play_circle" size={34} fill={1} color="var(--text-muted)" />

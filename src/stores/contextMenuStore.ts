@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — ContextMenu Store
+ * Gega Gallery — ContextMenu Store
  *
  * 管理右键菜单的显示状态和目标文件
  */

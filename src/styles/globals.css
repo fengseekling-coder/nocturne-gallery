@@ -1,5 +1,5 @@
 /*
- * Nocturne Gallery — Global Styles
+ * Gega Gallery — Global Styles
  */
 
 @import './tokens.css';
@@ -27,6 +27,8 @@ html, body, #root {
   letter-spacing: 0;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* 默认可点击；仅 [data-tauri-drag-region] 参与拖拽，避免无边框窗口整页无法点按 */
+  -webkit-app-region: no-drag;
 }
 
 body,

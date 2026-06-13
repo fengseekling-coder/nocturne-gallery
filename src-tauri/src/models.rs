@@ -107,6 +107,9 @@ pub struct MediaFilter {
     pub source_folder: Option<String>,
     pub library_root_path: Option<String>,
     pub keyword: Option<String>,
+    /// 为 true 时「AI 提示词库」作为虚拟大分组：不按 source_folder 过滤，全库按 AI/Prompt 条件筛选。
+    #[serde(default)]
+    pub virtual_ai_prompts_view: bool,
 }
 
 /// 网页书签

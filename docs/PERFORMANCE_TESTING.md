@@ -1,4 +1,4 @@
-# Nocturne Gallery 性能测试指南
+# Gega Gallery 性能测试指南
 
 ## 测试环境准备
 
@@ -10,7 +10,7 @@
 
 # PowerShell 示例：复制图片创建测试集
 $sourceFolder = "C:\path\to\your\images"
-$targetFolder = "F:\Nocturne Gallery\nocturne-gallery\test-images"
+$targetFolder = "F:\Gega Gallery\nocturne-gallery\test-images"
 
 # 创建目标文件夹
 New-Item -ItemType Directory -Force -Path $targetFolder

@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — UI 类型定义
+ * Gega Gallery — UI 类型定义
  */
 
 /** 侧边栏导航项 */

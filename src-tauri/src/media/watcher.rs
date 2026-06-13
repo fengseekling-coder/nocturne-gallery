@@ -1,11 +1,9 @@
-/**
- * Nocturne Gallery — 文件监控模块
- *
- * 使用 notify crate 监控灵感库根目录下的文件变化
- * 自动检测新增文件并入库
- */
+//! Gega Gallery — 文件监控模块
+//!
+//! 使用 notify crate 监控灵感库根目录下的文件变化。
+//! 自动检测新增文件并入库。
 
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, EventKind};
+use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use rusqlite::OptionalExtension;
@@ -18,6 +16,7 @@ use std::time::Duration;
 
 use crate::db::open_conn;
 use crate::media::scanner;
+use tauri::{AppHandle, Emitter};
 
 static IN_FLIGHT_ENRICH: Lazy<Mutex<HashSet<PathBuf>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
@@ -35,16 +34,18 @@ const DEBOUNCE_SECONDS: u64 = 2;
 
 impl LibraryWatcher {
     /// 创建并启动监控器
-    pub fn new(library_root: &str, db_path: &str) -> Result<Self, String> {
+    pub fn new(library_root: &str, db_path: &str, app: AppHandle) -> Result<Self, String> {
         let library_root_path = PathBuf::from(library_root);
         let db_path_string = db_path.to_string();
 
-        // 在后台启动事件处理循环和监控器
-        Self::start_watcher(library_root_path, db_path_string)
+        Self::start_watcher(library_root_path, db_path_string, app)
     }
 
-    /// 启动监控器（静态方法，避免 self 生命周期问题）
-    fn start_watcher(library_root: PathBuf, db_path: String) -> Result<Self, String> {
+    fn start_watcher(
+        library_root: PathBuf,
+        db_path: String,
+        app: AppHandle,
+    ) -> Result<Self, String> {
         let (tx, rx) = channel();
 
         // 创建监控器
@@ -55,19 +56,30 @@ impl LibraryWatcher {
                 }
             },
             Config::default().with_poll_interval(Duration::from_secs(2)),
-        ).map_err(|e| format!("Failed to create watcher: {}", e))?;
+        )
+        .map_err(|e| format!("Failed to create watcher: {}", e))?;
 
         // 监控整个库目录
-        watcher.watch(&library_root, RecursiveMode::Recursive)
+        watcher
+            .watch(&library_root, RecursiveMode::Recursive)
             .map_err(|e| format!("Failed to watch directory: {}", e))?;
 
-        eprintln!("[watcher] Started file system event loop for: {:?}", library_root);
+        eprintln!(
+            "[watcher] Started file system event loop for: {:?}",
+            library_root
+        );
 
         // 创建关闭信号
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // 在后台启动事件处理循环
-        Self::start_event_loop(rx, library_root.clone(), db_path.clone(), Arc::clone(&shutdown));
+        Self::start_event_loop(
+            rx,
+            library_root.clone(),
+            db_path.clone(),
+            Arc::clone(&shutdown),
+            app,
+        );
 
         Ok(Self {
             _watcher: watcher,
@@ -89,14 +101,19 @@ impl LibraryWatcher {
         library_root: PathBuf,
         db_path: String,
         shutdown: Arc<AtomicBool>,
+        app: AppHandle,
     ) {
         const BATCH_DRAIN_WINDOW: Duration = Duration::from_millis(200);
         const BATCH_MAX_PARALLEL: usize = 4;
 
         std::thread::spawn(move || {
-            eprintln!("[watcher] Event loop thread started for: {:?}", library_root);
+            eprintln!(
+                "[watcher] Event loop thread started for: {:?}",
+                library_root
+            );
 
-            let mut recent_events: std::collections::HashMap<PathBuf, u64> = std::collections::HashMap::new();
+            let mut recent_events: std::collections::HashMap<PathBuf, u64> =
+                std::collections::HashMap::new();
 
             loop {
                 if shutdown.load(Ordering::Relaxed) {
@@ -116,7 +133,9 @@ impl LibraryWatcher {
                 let mut events: Vec<notify::Event> = vec![first_event];
                 let drain_deadline = std::time::Instant::now() + BATCH_DRAIN_WINDOW;
                 while std::time::Instant::now() < drain_deadline {
-                    if shutdown.load(Ordering::Relaxed) { break; }
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
                     match rx.try_recv() {
                         Ok(e) => events.push(e),
                         Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(10)),
@@ -126,7 +145,7 @@ impl LibraryWatcher {
 
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_else(|_| std::time::Duration::ZERO)
+                    .unwrap_or(std::time::Duration::ZERO)
                     .as_secs();
 
                 let mut paths_to_enqueue: Vec<PathBuf> = Vec::new();
@@ -172,9 +191,13 @@ impl LibraryWatcher {
                 {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("[watcher] Failed to build thread pool: {}, falling back to serial", e);
+                        eprintln!(
+                            "[watcher] Failed to build thread pool: {}, falling back to serial",
+                            e
+                        );
+                        let app_for_batch = app.clone();
                         for p in &paths_to_enqueue {
-                            enqueue_enrich_task(p, &db_path, &library_root);
+                            enqueue_enrich_task(p, &db_path, &library_root, app_for_batch.clone());
                         }
                         continue;
                     }
@@ -182,14 +205,23 @@ impl LibraryWatcher {
 
                 let db_path_ref = &db_path;
                 let library_root_ref = &library_root;
+                let app_for_batch = app.clone();
                 pool.install(|| {
                     paths_to_enqueue.par_iter().for_each(|p| {
-                        enqueue_enrich_task(p, db_path_ref, library_root_ref);
+                        enqueue_enrich_task(
+                            p,
+                            db_path_ref,
+                            library_root_ref,
+                            app_for_batch.clone(),
+                        );
                     });
                 });
             }
 
-            eprintln!("[watcher] Event loop thread stopped for: {:?}", library_root);
+            eprintln!(
+                "[watcher] Event loop thread stopped for: {:?}",
+                library_root
+            );
         });
     }
 
@@ -204,7 +236,10 @@ impl LibraryWatcher {
 
 impl Drop for LibraryWatcher {
     fn drop(&mut self) {
-        eprintln!("[watcher] Dropping watcher for root: {:?}", self._library_root);
+        eprintln!(
+            "[watcher] Dropping watcher for root: {:?}",
+            self._library_root
+        );
         // 确保后台线程能收到关闭信号
         self.shutdown.store(true, Ordering::Relaxed);
         // _watcher 会在 drop 时自动停止监控
@@ -212,7 +247,7 @@ impl Drop for LibraryWatcher {
 }
 
 /// 导入单个文件
-fn enqueue_enrich_task(path: &Path, db_path: &str, library_root: &Path) {
+fn enqueue_enrich_task(path: &Path, db_path: &str, library_root: &Path, app: AppHandle) {
     if !path_is_in_library(path, library_root) {
         return;
     }
@@ -240,33 +275,42 @@ fn enqueue_enrich_task(path: &Path, db_path: &str, library_root: &Path) {
             }
         }
 
-        let _guard = InFlightGuard {
-            key: canonical_key,
-        };
+        let _guard = InFlightGuard { key: canonical_key };
 
         if !is_file_stable(&path_buf) {
             eprintln!("[watcher] File not stable, skipping enrich: {:?}", path_buf);
             return;
         }
 
-        let media_id = match ensure_media_record_for_path(&path_buf, &db_path, &library_root) {
-            Ok(Some(id)) => id,
-            Ok(None) => return,
-            Err(e) => {
-                eprintln!("[watcher] Failed to prepare media record for {:?}: {}", path_buf, e);
-                return;
-            }
-        };
+        let (media_id, is_new) =
+            match ensure_media_record_for_path(&path_buf, &db_path, &library_root) {
+                Ok((Some(id), new)) => (id, new),
+                Ok((None, _)) => return,
+                Err(e) => {
+                    eprintln!(
+                        "[watcher] Failed to prepare media record for {:?}: {}",
+                        path_buf, e
+                    );
+                    return;
+                }
+            };
+        if is_new {
+            let _ = app.emit(
+                "library_files_imported",
+                serde_json::json!({ "imported": 1_i64 }),
+            );
+        }
         let filepath = path_buf.to_string_lossy().to_string();
         let library_root_str = library_root.to_string_lossy().to_string();
-        if let Err(e) = scanner::scan_single_file_enrich(
-            &media_id,
-            &filepath,
-            &db_path,
-            &library_root_str,
-        ) {
+        if let Err(e) =
+            scanner::scan_single_file_enrich(&media_id, &filepath, &db_path, &library_root_str)
+        {
             eprintln!("[watcher] Enrich task failed for {:?}: {}", path_buf, e);
         }
+        let _ = app.emit(
+            "media_metadata_updated",
+            serde_json::json!({ "id": media_id }),
+        );
     });
 }
 
@@ -274,26 +318,23 @@ fn ensure_media_record_for_path(
     path: &Path,
     db_path: &str,
     library_root: &Path,
-) -> Result<Option<String>, String> {
+) -> Result<(Option<String>, bool), String> {
     if !is_supported_watch_file(path) {
-        return Ok(None);
+        return Ok((None, false));
     }
 
     let filepath = path.to_string_lossy().to_string();
     if let Some(id) = media_id_for_path(db_path, &filepath)? {
-        return Ok(Some(id));
+        return Ok((Some(id), false));
     }
 
     let library_root_str = library_root.to_string_lossy().to_string();
-    let inserted_id = scanner::scan_single_file_minimal(
-        &filepath,
-        &filepath,
-        db_path,
-        &library_root_str,
-    )
-    .map_err(|e| format!("minimal scan failed: {}", e))?;
+    let inserted_id =
+        scanner::scan_single_file_minimal(&filepath, &filepath, db_path, &library_root_str)
+            .map_err(|e| format!("minimal scan failed: {}", e))?;
 
-    Ok(media_id_for_path(db_path, &filepath)?.or(Some(inserted_id)))
+    let id = media_id_for_path(db_path, &filepath)?.unwrap_or(inserted_id);
+    Ok((Some(id), true))
 }
 
 fn media_id_for_path(db_path: &str, filepath: &str) -> Result<Option<String>, String> {
@@ -338,7 +379,12 @@ fn normalize_watch_path(path: &Path) -> Option<PathBuf> {
     let canonical = std::fs::canonicalize(path).ok()?;
     #[cfg(windows)]
     {
-        Some(PathBuf::from(canonical.to_string_lossy().replace('/', "\\").to_lowercase()))
+        Some(PathBuf::from(
+            canonical
+                .to_string_lossy()
+                .replace('/', "\\")
+                .to_lowercase(),
+        ))
     }
     #[cfg(not(windows))]
     {
@@ -349,7 +395,12 @@ fn normalize_watch_path(path: &Path) -> Option<PathBuf> {
 fn fallback_watch_key(path: &Path) -> PathBuf {
     let normalized = path
         .components()
-        .map(|component| component.as_os_str().to_string_lossy().replace('/', std::path::MAIN_SEPARATOR_STR))
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .replace('/', std::path::MAIN_SEPARATOR_STR)
+        })
         .collect::<Vec<_>>()
         .join(std::path::MAIN_SEPARATOR_STR);
 
@@ -400,7 +451,9 @@ fn is_file_stable(path: &Path) -> bool {
 
 /// 根据扩展名分类
 fn classify_extension(ext: &str) -> Option<&'static str> {
-    const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "avif", "heic", "svg"];
+    const IMAGE_EXTS: &[&str] = &[
+        "jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "avif", "heic", "svg",
+    ];
     const VIDEO_EXTS: &[&str] = &["mp4", "mov", "avi", "mkv", "webm", "flv"];
     const _3D_EXTS: &[&str] = &["obj", "fbx", "glb", "gltf", "blend", "stl"];
     const DOC_EXTS: &[&str] = &["pdf", "psd", "ai", "sketch", "fig", "xd", "zip", "rar"];
@@ -426,9 +479,9 @@ fn classify_extension(ext: &str) -> Option<&'static str> {
     None
 }
 
-/// 初始化库目录结构（在用户选择的父目录下创建 NocturneGallery 文件夹）
+/// 初始化库目录结构（在用户选定的库根目录下创建子文件夹与 `.nocturne`）
 ///
-/// 如果 NocturneGallery 已存在，则直接使用（不重复创建）。
+/// 若根目录已存在且含 `.nocturne`，则直接使用（不重复创建）。
 /// 此函数只负责创建目录结构，不写入 config.json（由 init_library command 处理）。
 pub fn init_library_structure(library_root: &str) -> Result<(), String> {
     let root = Path::new(library_root);
@@ -437,7 +490,7 @@ pub fn init_library_structure(library_root: &str) -> Result<(), String> {
     let already_exists = root.exists();
 
     if already_exists {
-        eprintln!("[init] NocturneGallery directory already exists at: {:?}", root);
+        eprintln!("[init] Library directory already exists at: {:?}", root);
         // 验证是否已经是有效的库根（已有 .nocturne 目录）
         if is_valid_library_root(library_root) {
             eprintln!("[init] Using existing library at: {:?}", root);
@@ -517,11 +570,10 @@ fn merge_folders(from: &Path, to: &Path) -> Result<(), String> {
     if !from.exists() {
         return Ok(());
     }
-    std::fs::create_dir_all(to)
-        .map_err(|e| format!("Failed to create target folder: {}", e))?;
+    std::fs::create_dir_all(to).map_err(|e| format!("Failed to create target folder: {}", e))?;
 
-    for entry in std::fs::read_dir(from)
-        .map_err(|e| format!("Failed to read source folder: {}", e))?
+    for entry in
+        std::fs::read_dir(from).map_err(|e| format!("Failed to read source folder: {}", e))?
     {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
         let from_path = entry.path();
@@ -546,13 +598,14 @@ pub struct LibraryConfig {
     pub version: String,
 }
 
-/// 读取库配置
+/// 读取库目录内可选的本地配置（`{库根}/.nocturne/config.json`）。
+/// 注意：应用实际使用的库根路径来自 **App 数据目录** 下的 `.nocturne/config.json`，
+/// 与库内该文件不是同一份；库内文件若存在仅作兼容/遗留，不应作为权威来源。
 pub fn read_library_config(root_path: &str) -> Result<LibraryConfig, String> {
     let config_path = Path::new(root_path).join(".nocturne/config.json");
     let content = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("Failed to read config: {}", e))?;
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse config: {}", e))
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse config: {}", e))
 }
 
 /// 检查路径是否是有效的库根目录
@@ -561,17 +614,52 @@ pub fn is_valid_library_root(path: &str) -> bool {
     data_dir.exists() && data_dir.is_dir()
 }
 
+/// 将配置中的库根规范为绝对路径（不追加 GegaGallery 等子目录）。
+pub fn normalize_library_root_path(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("路径为空".to_string());
+    }
+    let p = Path::new(trimmed);
+    if p.exists() {
+        let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        if !canonical.is_dir() {
+            return Err(format!("所选路径不是文件夹：{}", trimmed));
+        }
+        Ok(canonical.to_string_lossy().into_owned())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+/// 从 AppData 下的 config.json 读取已验证、规范化后的库根路径。
+pub fn configured_library_root_from_app_data(app_data_dir: &Path) -> Option<String> {
+    let config_path = app_data_dir.join(".nocturne/config.json");
+    let content = std::fs::read_to_string(&config_path).ok()?;
+    let config: LibraryConfig = serde_json::from_str(&content).ok()?;
+    if !is_valid_library_root(&config.root_path) {
+        return None;
+    }
+    normalize_library_root_path(&config.root_path).ok()
+}
+
 /// 更新数据库中的文件夹路径（媒体库→灵感库，项目文件→作品集）
 pub fn update_folder_paths_in_db(db_path: &str, library_root: &str) -> Result<(), String> {
-    let mut conn = crate::db::open_conn(db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let mut conn =
+        crate::db::open_conn(db_path).map_err(|e| format!("Failed to open database: {}", e))?;
 
     crate::db::crud::update_folder_paths_in_db(&mut conn)
         .map_err(|e| format!("Failed to update paths in DB: {}", e))?;
 
+    crate::db::crud::repair_unix_path_separators_in_media_paths(&conn)
+        .map_err(|e| format!("Failed to repair path separators in DB: {}", e))?;
+
     crate::db::crud::update_library_root_prefixes(&mut conn, library_root)
         .map_err(|e| format!("Failed to update library root prefixes in DB: {:?}", e))?;
 
-    eprintln!("[watcher] Database paths updated for library: {}", library_root);
+    eprintln!(
+        "[watcher] Database paths updated for library: {}",
+        library_root
+    );
     Ok(())
 }

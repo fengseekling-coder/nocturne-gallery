@@ -1,21 +1,31 @@
 use tauri::{command, AppHandle, Emitter, Manager};
 pub mod ai_tools;
 
-use tauri_plugin_dialog::DialogExt;
+use rusqlite::{params_from_iter, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use rusqlite::{params_from_iter, OptionalExtension};
+use tauri_plugin_dialog::DialogExt;
 
 use crate::db::{crud, open_conn};
-use crate::media::{scanner, thumbnail, watcher, hash as image_hash};
-use crate::models::{AiChatLoadResult, AiChatSession, GroupItemCount, MediaCursor, MediaDetail, MediaFilter, MediaPage, NavItemCount, ScanResult, DuplicateCheckResult, DuplicatePlacement, FileInfo, ImportPathsResult, FileMetaJSON, MediaFile};
+use crate::media::watcher::LibraryWatcher;
+use crate::media::{hash as image_hash, media_bundle, scanner, thumbnail, watcher};
+use crate::models::{
+    AiChatLoadResult, AiChatSession, DuplicateCheckResult, DuplicatePlacement, FileInfo,
+    GroupItemCount, ImportPathsResult, MediaCursor, MediaDetail, MediaFile, MediaFilter, MediaPage,
+    NavItemCount, ScanResult,
+};
 use crate::AppState;
+
+type StartupBackfillRow = (String, String, Option<String>, Option<String>);
 
 #[derive(serde::Serialize)]
 pub struct BatchFileOperationResult {
     pub succeeded: usize,
     pub failed: usize,
+    /// 首个失败原因（便于前端 Toast，而非仅「失败」）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_error: Option<String>,
 }
 
 #[command]
@@ -50,18 +60,20 @@ pub fn start_file_drag(window: tauri::Window, paths: Vec<String>) -> Result<(), 
 }
 
 fn media_id_by_filepath(conn: &rusqlite::Connection, filepath: &str) -> Result<String, String> {
-    conn
-        .query_row(
-            "SELECT id FROM media_files WHERE filepath = ? LIMIT 1",
-            rusqlite::params![filepath],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Media file not found for path: {}", filepath))
+    conn.query_row(
+        "SELECT id FROM media_files WHERE filepath = ? LIMIT 1",
+        rusqlite::params![filepath],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("Media file not found for path: {}", filepath))
 }
 
-fn media_file_by_filepath(conn: &rusqlite::Connection, filepath: &str) -> Result<MediaFile, String> {
+fn media_file_by_filepath(
+    conn: &rusqlite::Connection,
+    filepath: &str,
+) -> Result<MediaFile, String> {
     let id = media_id_by_filepath(conn, filepath)?;
     crud::get_media_file_by_id(conn, &id).map_err(|e| e.to_string())
 }
@@ -133,10 +145,7 @@ fn has_supported_image_signature(bytes: &[u8]) -> bool {
         || (bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP")
 }
 
-fn read_supported_ai_input_file_base64(
-    raw_path: &str,
-    label: &str,
-) -> Result<String, String> {
+fn read_supported_ai_input_file_base64(raw_path: &str, label: &str) -> Result<String, String> {
     const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
     const MAX_PDF_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -144,7 +153,11 @@ fn read_supported_ai_input_file_base64(
     let metadata = std::fs::metadata(&path)
         .map_err(|e| format!("无法读取{}信息：{} ({})", label, path.display(), e))?;
     if metadata.len() > MAX_IMAGE_BYTES {
-        return Err(format!("{}超过 {}MB，无法读取", label, MAX_IMAGE_BYTES / 1024 / 1024));
+        return Err(format!(
+            "{}超过 {}MB，无法读取",
+            label,
+            MAX_IMAGE_BYTES / 1024 / 1024
+        ));
     }
 
     let bytes = std::fs::read(&path)
@@ -155,7 +168,11 @@ fn read_supported_ai_input_file_base64(
         return Err(format!("{}不是受支持的图片或 PDF 文件", label));
     }
     if is_pdf && metadata.len() > MAX_PDF_BYTES {
-        return Err(format!("{}超过 {}MB，无法读取", label, MAX_PDF_BYTES / 1024 / 1024));
+        return Err(format!(
+            "{}超过 {}MB，无法读取",
+            label,
+            MAX_PDF_BYTES / 1024 / 1024
+        ));
     }
 
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
@@ -207,7 +224,12 @@ fn assign_category_for_filepath(
         )
         .optional()
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Imported media not found for category assignment: {}", filepath))?;
+        .ok_or_else(|| {
+            format!(
+                "Imported media not found for category assignment: {}",
+                filepath
+            )
+        })?;
 
     crud::set_media_category(&conn, &media_id, category_name).map_err(|e| e.to_string())
 }
@@ -216,45 +238,44 @@ fn assign_category_for_filepath(
 //  Additional imports for paste functionality
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-use base64;
 use base64::Engine as _;
-use chrono;
 use image::ImageEncoder;
 
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
 #[cfg(target_os = "windows")]
-use windows::core::HSTRING;
-#[cfg(target_os = "windows")]
 use windows::core::HRESULT;
 #[cfg(target_os = "windows")]
+use windows::core::HSTRING;
+#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
-    BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
-    DeleteObject, GetDIBits, GetObjectW, HBITMAP,
+    CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_THUMBNAILONLY};
+use windows::Win32::UI::Shell::{
+    IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_THUMBNAILONLY,
+};
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //  å†…éƒ¨å·¥å…·ï¼šä»Ž AppHandle æ´¾ç“Ÿ DB è·¯å¾„
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn db_path(handle: &AppHandle) -> Result<String, String> {
-    let data_dir = handle.path().app_data_dir()
+    let data_dir = handle
+        .path()
+        .app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {}", e))?;
 
     // 优先从 config.json 读取 library_root，拼接库目录 DB 路径
-    let config_path = data_dir.join(".nocturne/config.json");
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
-        if let Ok(config) = serde_json::from_str::<watcher::LibraryConfig>(&content) {
-            return Ok(std::path::Path::new(&config.root_path)
-                .join(".nocturne")
-                .join("nocturne.db")
-                .to_string_lossy()
-                .to_string());
-        }
+    if let Some(root) = watcher::configured_library_root_from_app_data(&data_dir) {
+        return Ok(std::path::Path::new(&root)
+            .join(".nocturne")
+            .join("nocturne.db")
+            .to_string_lossy()
+            .to_string());
     }
 
     // 无库配置时回落 AppData（首次初始化期间）
@@ -263,36 +284,25 @@ fn db_path(handle: &AppHandle) -> Result<String, String> {
 
 /// Get thumbnail directory (deprecated - new architecture uses .nocturne_meta/ per directory)
 #[allow(dead_code)]
-#[allow(dead_code)]
 fn thumbs_dir(handle: &AppHandle) -> Result<String, String> {
     let root = library_root(handle)?;
     Ok(std::path::Path::new(&root)
-        .join(".nocturne").join("thumbs")
+        .join(".nocturne")
+        .join("thumbs")
         .to_string_lossy()
         .to_string())
 }
 
 /// èŽ·å–åº“æ ¹ç›®å½•è·¯å¾„
+/// 将用户选择的文件夹规范为库根路径（不自动创建/重命名到 GegaGallery 等子目录）。
 pub(super) fn library_root(handle: &AppHandle) -> Result<String, String> {
-    // ä¼˜å…ˆä»Žé…ç½®è¯»å–
-    let config_path = handle
+    let data_dir = handle
         .path()
         .app_data_dir()
-        .map(|p| p.join(".nocturne/config.json").to_string_lossy().to_string())
-        .map_err(|e| format!("Failed to get config path: {}", e))?;
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
 
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
-        if let Ok(config) = serde_json::from_str::<watcher::LibraryConfig>(&content) {
-            return Ok(config.root_path);
-        }
-    }
-
-    // å¦åˆ™è¿“å›žé»˜è®¤çš„ AppData ç›®å½•
-    handle
-        .path()
-        .app_data_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .map_err(|e| format!("Failed to get app data dir: {}", e))
+    watcher::configured_library_root_from_app_data(&data_dir)
+        .ok_or_else(|| "未配置灵感库，请先在设置中选择灵感库根目录".to_string())
 }
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -306,23 +316,45 @@ fn normalize_path_for_boundary_check(path: &str) -> Option<std::path::PathBuf> {
         return path.canonicalize().ok();
     }
 
-    let cleaned = path.to_string_lossy().replace('/', "\\");
-    let cleaned_path = std::path::PathBuf::from(cleaned);
-    if cleaned_path.exists() {
-        return cleaned_path.canonicalize().ok();
+    #[cfg(windows)]
+    {
+        let cleaned = path.to_string_lossy().replace('/', "\\");
+        let cleaned_path = std::path::PathBuf::from(cleaned);
+        if cleaned_path.exists() {
+            return cleaned_path.canonicalize().ok();
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let cleaned = path.to_string_lossy().replace('\\', "/");
+        if cleaned != path.to_string_lossy() {
+            let cleaned_path = std::path::PathBuf::from(&cleaned);
+            if cleaned_path.exists() {
+                return cleaned_path.canonicalize().ok();
+            }
+        }
     }
 
     None
 }
 
 fn same_or_descendant_path(candidate: &std::path::Path, root: &std::path::Path) -> bool {
-    let candidate = candidate.canonicalize().unwrap_or_else(|_| candidate.to_path_buf());
+    let candidate = candidate
+        .canonicalize()
+        .unwrap_or_else(|_| candidate.to_path_buf());
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     #[cfg(windows)]
-    let candidate_str = candidate.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    let candidate_str = candidate
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
     #[cfg(windows)]
-    let root_str = root.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    let root_str = root
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
 
     #[cfg(not(windows))]
     let candidate_str = candidate.to_string_lossy().replace('\\', "/");
@@ -341,19 +373,51 @@ fn same_or_descendant_path(candidate: &std::path::Path, root: &std::path::Path) 
     candidate_str.starts_with(&root_with_sep)
 }
 
-fn validate_path_in_library(file_path: &str, library_root: &str) -> Result<(), String> {
-    let candidate = normalize_path_for_boundary_check(file_path).unwrap_or_else(|| std::path::PathBuf::from(file_path));
-    let root = normalize_path_for_boundary_check(library_root).unwrap_or_else(|| std::path::PathBuf::from(library_root));
-
-    if !same_or_descendant_path(&candidate, &root) {
-        let err = format!(
-            "路径越界：不允许操作库目录外的文件（文件：{}，库根：{}）",
-            file_path, library_root
-        );
-        eprintln!("[validate_path] {}", err);
-        return Err(err);
+fn normalize_path_string_for_prefix(path: &str) -> String {
+    let mut s = path.trim().replace('/', std::path::MAIN_SEPARATOR_STR);
+    while s.ends_with(std::path::MAIN_SEPARATOR) && s.len() > 1 {
+        s.pop();
     }
-    Ok(())
+    #[cfg(windows)]
+    {
+        return s.to_ascii_lowercase();
+    }
+    #[cfg(not(windows))]
+    {
+        s
+    }
+}
+
+/// 当路径尚不存在（如回收站目标）时，用规范化前缀判断是否在库根下。
+fn path_under_library_root_prefix(file_path: &str, library_root: &str) -> bool {
+    let file = normalize_path_string_for_prefix(file_path);
+    let mut root = normalize_path_string_for_prefix(library_root);
+    if !root.is_empty() && !root.ends_with(std::path::MAIN_SEPARATOR) {
+        root.push(std::path::MAIN_SEPARATOR);
+    }
+    file == root.trim_end_matches(std::path::MAIN_SEPARATOR) || file.starts_with(&root)
+}
+
+fn validate_path_in_library(file_path: &str, library_root: &str) -> Result<(), String> {
+    let candidate = normalize_path_for_boundary_check(file_path)
+        .unwrap_or_else(|| std::path::PathBuf::from(file_path));
+    let root = normalize_path_for_boundary_check(library_root)
+        .unwrap_or_else(|| std::path::PathBuf::from(library_root));
+
+    if same_or_descendant_path(&candidate, &root) {
+        return Ok(());
+    }
+
+    if path_under_library_root_prefix(file_path, library_root) {
+        return Ok(());
+    }
+
+    let err = format!(
+        "路径越界：不允许操作库目录外的文件（文件：{}，库根：{}）",
+        file_path, library_root
+    );
+    eprintln!("[validate_path] {}", err);
+    Err(err)
 }
 
 fn validate_library_relative_folder(folder: &str) -> Result<String, String> {
@@ -367,18 +431,202 @@ fn validate_library_relative_folder(folder: &str) -> Result<String, String> {
         return Err("目标文件夹不能是绝对路径".to_string());
     }
 
-    let has_component = path.components().try_fold(false, |_, component| {
-        match component {
+    let has_component = path
+        .components()
+        .try_fold(false, |_, component| match component {
             std::path::Component::Normal(_) => Ok(true),
             _ => Err("目标文件夹不能包含路径穿越或盘符".to_string()),
-        }
-    })?;
+        })?;
 
     if !has_component {
         return Err("目标文件夹不能为空".to_string());
     }
 
     Ok(trimmed.to_string())
+}
+
+const TRASH_FOLDER_NAME: &str = "回收站";
+
+fn record_fail(first_error: &mut Option<String>, reason: impl Into<String>) {
+    if first_error.is_none() {
+        *first_error = Some(reason.into());
+    }
+}
+
+fn path_allowed_for_trash_op(
+    stored_path: &str,
+    resolved: Option<&std::path::Path>,
+    library_root: &str,
+) -> bool {
+    if validate_path_in_library(stored_path, library_root).is_ok() {
+        return true;
+    }
+    if let Some(p) = resolved {
+        if validate_path_in_library(&p.to_string_lossy(), library_root).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn restore_folder_for_trash_item(pre_trash: &str, current_source_folder: &str) -> String {
+    let pre = pre_trash.trim();
+    if !pre.is_empty() && pre != TRASH_FOLDER_NAME {
+        return pre.to_string();
+    }
+    let cur = current_source_folder.trim();
+    if !cur.is_empty() && cur != TRASH_FOLDER_NAME {
+        return cur.to_string();
+    }
+    "灵感库".to_string()
+}
+
+fn unique_path_in_dir(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    let mut candidate = dir.join(filename);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = std::path::Path::new(filename);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| format!(".{}", e))
+        .unwrap_or_default();
+    for n in 1..=10_000 {
+        candidate = dir.join(format!("{} ({}){}", stem, n, ext));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(filename)
+}
+
+fn resolve_library_media_on_disk(
+    stored_path: &str,
+    filename: &str,
+    source_folder: &str,
+    library_root: &str,
+) -> Option<std::path::PathBuf> {
+    let folder = source_folder.trim();
+    let folder_ref = if folder.is_empty() || folder == TRASH_FOLDER_NAME {
+        None
+    } else {
+        Some(folder)
+    };
+    crate::media::path_util::resolve_media_file_on_disk_with_folder_hint(
+        stored_path,
+        Some(library_root),
+        Some(filename),
+        folder_ref,
+    )
+}
+
+fn is_movable_library_entry(path: &std::path::Path) -> bool {
+    path.is_file() || path.is_dir()
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("无法创建目录 {}：{}", dst.display(), e))?;
+    for entry in
+        std::fs::read_dir(src).map_err(|e| format!("无法读取目录 {}：{}", src.display(), e))?
+    {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("无法读取目录项类型：{}", e))?;
+        let target = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), &target).map_err(|e| {
+                format!(
+                    "复制失败 {} -> {}：{}",
+                    entry.path().display(),
+                    target.display(),
+                    e
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path_recursive(path: &std::path::Path) -> Result<(), String> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path).map_err(|e| format!("无法删除目录 {}：{}", path.display(), e))
+    } else if path.exists() {
+        std::fs::remove_file(path).map_err(|e| format!("无法删除文件 {}：{}", path.display(), e))
+    } else {
+        Ok(())
+    }
+}
+
+fn move_file_within_library(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(), String> {
+    if !is_movable_library_entry(source) {
+        return Err(format!("源文件不存在或无法访问：{}", source.display()));
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("无法创建目标目录：{}", e))?;
+    }
+    if target.exists() {
+        return Err(format!("目标路径已存在：{}", target.display()));
+    }
+    if source.is_dir() {
+        match std::fs::rename(source, target) {
+            Ok(()) => return Ok(()),
+            Err(_) => {
+                copy_dir_recursive(source, target)?;
+                remove_path_recursive(source).map_err(|e| {
+                    format!(
+                        "目录已复制到目标位置，但无法删除源目录：{} ({})",
+                        source.display(),
+                        e
+                    )
+                })?;
+                return Ok(());
+            }
+        }
+    }
+    match std::fs::rename(source, target) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            std::fs::copy(source, target).map_err(|copy_err| {
+                format!("移动文件失败（rename: {}；copy: {}）", rename_err, copy_err)
+            })?;
+            std::fs::remove_file(source).map_err(|e| {
+                format!(
+                    "文件已复制到目标位置，但无法删除源文件：{} ({})",
+                    source.display(),
+                    e
+                )
+            })?;
+            Ok(())
+        }
+    }
+}
+
+fn relocate_bundle_after_move(
+    conn: &rusqlite::Connection,
+    media_id: &str,
+    old_filepath: &str,
+    new_filepath: &str,
+    old_filename: &str,
+    new_filename: &str,
+    library_root: &str,
+) {
+    media_bundle::relocate_media_bundle_after_main_move(
+        conn,
+        media_id,
+        old_filepath,
+        new_filepath,
+        old_filename,
+        new_filename,
+        library_root,
+    );
 }
 
 fn is_supported_import_file(path: &std::path::Path) -> bool {
@@ -422,39 +670,6 @@ fn is_supported_import_file(path: &std::path::Path) -> bool {
     )
 }
 
-fn find_meta_json_path(meta_dir: &std::path::Path, filename: &str) -> Option<std::path::PathBuf> {
-    let direct_path = meta_dir.join(format!("{}.json", filename));
-    if direct_path.exists() {
-        return Some(direct_path);
-    }
-
-    let file_stem = std::path::Path::new(filename)
-        .file_stem()
-        .and_then(|segment| segment.to_str())
-        .unwrap_or(filename);
-
-    if file_stem == filename {
-        return None;
-    }
-
-    let legacy_path = meta_dir.join(format!("{}.json", file_stem));
-    if legacy_path.exists() {
-        Some(legacy_path)
-    } else {
-        None
-    }
-}
-
-fn update_meta_json_filename(meta_path: &std::path::Path, new_filename: &str) -> Result<String, String> {
-    let content = std::fs::read_to_string(meta_path)
-        .map_err(|e| format!("Failed to read meta JSON: {}", e))?;
-    let mut meta = serde_json::from_str::<FileMetaJSON>(&content)
-        .map_err(|e| format!("Failed to parse meta JSON: {}", e))?;
-    meta.file_name = new_filename.to_string();
-    serde_json::to_string_pretty(&meta)
-        .map_err(|e| format!("Failed to serialize meta JSON: {}", e))
-}
-
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //  Commands
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -478,7 +693,10 @@ fn folder_paths_updated_once() -> &'static AtomicBool {
 
 /// 为指定 item 生成 preview 档缩略图（2048px WebP）
 #[tauri::command]
-pub fn generate_preview_thumbnail_for_item(app: tauri::AppHandle, item_id: String) -> Result<String, String> {
+pub fn generate_preview_thumbnail_for_item(
+    app: tauri::AppHandle,
+    item_id: String,
+) -> Result<String, String> {
     let db_path = db_path(&app).map_err(|e| format!("Failed to resolve DB path: {}", e))?;
     let conn = open_conn(&db_path).map_err(|e| format!("Failed to open DB: {}", e))?;
 
@@ -490,13 +708,18 @@ pub fn generate_preview_thumbnail_for_item(app: tauri::AppHandle, item_id: Strin
         return Err(format!("Source file not found: {}", file.filepath));
     }
 
-    let meta_dir = src.parent()
+    let meta_dir = src
+        .parent()
         .map(|p| p.join(".nocturne_meta"))
         .ok_or_else(|| "Cannot determine meta directory".to_string())?;
     std::fs::create_dir_all(&meta_dir).map_err(|e| format!("Failed to create meta dir: {}", e))?;
 
-    let preview_filename = format!("{}_preview.webp",
-        src.file_name().and_then(|s| s.to_str()).unwrap_or("preview"));
+    let preview_filename = format!(
+        "{}_preview.webp",
+        src.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("preview")
+    );
     let preview_dst = meta_dir.join(&preview_filename);
 
     crate::media::thumbnail::generate_preview_thumbnail(src, &preview_dst)
@@ -536,9 +759,7 @@ pub fn rebuild_missing_thumbnails(app: tauri::AppHandle) -> Result<(), String> {
     ).map_err(|e| format!("Failed to prepare query: {}", e))?;
 
     let items: Vec<(String, String, String)> = stmt
-        .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .map_err(|e| format!("Failed to query items: {}", e))?
         .filter_map(|r| r.ok())
         .collect();
@@ -580,18 +801,29 @@ pub fn rebuild_missing_thumbnails(app: tauri::AppHandle) -> Result<(), String> {
                     continue;
                 }
 
-                let meta_dir = src.parent()
+                let meta_dir = src
+                    .parent()
                     .map(|p| p.join(".nocturne_meta"))
                     .unwrap_or_else(|| std::path::Path::new("").to_path_buf());
 
-                let source_name_for_thumb = src.file_name().and_then(|s| s.to_str()).unwrap_or(filename);
+                let source_name_for_thumb =
+                    src.file_name().and_then(|s| s.to_str()).unwrap_or(filename);
                 let micro_filename = format!("{}_micro.webp", source_name_for_thumb);
                 let micro_dst = meta_dir.join(&micro_filename);
                 let micro_path_opt =
-                    crate::media::thumbnail::generate_micro_from_embedded_thumbnail(&src.to_string_lossy(), &micro_dst)
+                    crate::media::thumbnail::generate_micro_from_embedded_thumbnail(
+                        &src.to_string_lossy(),
+                        &micro_dst,
+                    )
                     .or_else(|| {
-                        if let Err(e) = crate::media::thumbnail::generate_micro_thumbnail(src, &micro_dst) {
-                            log::warn!("[rebuild] Micro thumbnail failed for '{}': {}", filename, e);
+                        if let Err(e) =
+                            crate::media::thumbnail::generate_micro_thumbnail(src, &micro_dst)
+                        {
+                            log::warn!(
+                                "[rebuild] Micro thumbnail failed for '{}': {}",
+                                filename,
+                                e
+                            );
                             None
                         } else if micro_dst.exists() {
                             Some(micro_dst.to_string_lossy().to_string())
@@ -611,7 +843,12 @@ pub fn rebuild_missing_thumbnails(app: tauri::AppHandle) -> Result<(), String> {
 
                 if micro_path_opt.is_some() || thumbhash_opt.is_some() {
                     if let Err(e) = crate::media::thumbnail::update_multi_tier_thumbnails(
-                        &conn, &id, micro_path_opt.as_deref(), None, None, thumbhash_opt.as_deref(),
+                        &conn,
+                        id,
+                        micro_path_opt.as_deref(),
+                        None,
+                        None,
+                        thumbhash_opt.as_deref(),
                     ) {
                         log::warn!("[rebuild] DB update failed for '{}': {}", filename, e);
                     }
@@ -619,19 +856,25 @@ pub fn rebuild_missing_thumbnails(app: tauri::AppHandle) -> Result<(), String> {
 
                 current += 1;
 
-                let _ = app.emit("thumbnail_rebuild_progress", serde_json::json!({
-                    "current": current,
-                    "total": total,
-                    "current_file": filename,
-                }));
+                let _ = app.emit(
+                    "thumbnail_rebuild_progress",
+                    serde_json::json!({
+                        "current": current,
+                        "total": total,
+                        "current_file": filename,
+                    }),
+                );
             }
 
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let _ = app.emit("thumbnail_rebuild_complete", serde_json::json!({
-            "total": total,
-        }));
+        let _ = app.emit(
+            "thumbnail_rebuild_complete",
+            serde_json::json!({
+                "total": total,
+            }),
+        );
         REBUILD_RUNNING.store(false, Ordering::Relaxed);
     });
 
@@ -653,8 +896,14 @@ pub async fn scan_directory(handle: AppHandle, path: String) -> Result<ScanResul
     eprintln!("[scan_directory] Library root: {}", library_root);
 
     // éªŒè¯æ‰«æè·¯å¾„å¿…é¡»åœ¨åº“æ ¹ç›®å½•èŒƒå›´å†…
-    if !same_or_descendant_path(std::path::Path::new(&path), std::path::Path::new(&library_root)) {
-        let err = format!("禁止扫描库目录以外的路径：{} (库根：{})", path, library_root);
+    if !same_or_descendant_path(
+        std::path::Path::new(&path),
+        std::path::Path::new(&library_root),
+    ) {
+        let err = format!(
+            "禁止扫描库目录以外的路径：{} (库根：{})",
+            path, library_root
+        );
         eprintln!("[scan_directory] Security check failed: {}", err);
         return Err(err);
     }
@@ -680,7 +929,6 @@ pub async fn scan_directory(handle: AppHandle, path: String) -> Result<ScanResul
         .to_string();
     eprintln!("[scan_directory] Thumbs dir: {}", thumbs);
 
-
     // èŽ·å–ç¼©ç•¥å›¾é˜Ÿåˆ—å¹¶æš‚åœå¤„ç†ï¼ˆæ‰¹é‡å¯¼å…¥æ—¶æš‚åœï¼‰
     let thumbnail_queue = {
         let state = handle.state::<AppState>();
@@ -697,11 +945,14 @@ pub async fn scan_directory(handle: AppHandle, path: String) -> Result<ScanResul
     let h = handle.clone();
     let result = tokio::task::spawn_blocking(move || {
         scanner::scan_directory_with_progress(&path, &db, &thumbs, |current, total, filename| {
-            let _ = h.emit("scan_progress", serde_json::json!({
-                "current": current,
-                "total": total,
-                "filename": filename,
-            }));
+            let _ = h.emit(
+                "scan_progress",
+                serde_json::json!({
+                    "current": current,
+                    "total": total,
+                    "filename": filename,
+                }),
+            );
         })
     })
     .await
@@ -709,12 +960,12 @@ pub async fn scan_directory(handle: AppHandle, path: String) -> Result<ScanResul
         let err = format!("Task join error: {}", e);
         eprintln!("[scan_directory] Task join failed: {}", err);
         err
-        })?
-        .map_err(|e| {
-            let err = format!("scan_directory failed: {:?}", e);
-            eprintln!("[scan_directory] Scan failed: {}", err);
-            err
-        });
+    })?
+    .map_err(|e| {
+        let err = format!("scan_directory failed: {:?}", e);
+        eprintln!("[scan_directory] Scan failed: {}", err);
+        err
+    });
 
     // æ‰«æå®ŒæˆåŽæ¢å¤ç¼©ç•¥å›¾å¤„ç†
     thumbnail_queue.wake_processor();
@@ -722,9 +973,16 @@ pub async fn scan_directory(handle: AppHandle, path: String) -> Result<ScanResul
 
     match &result {
         Ok(r) => {
-            log::info!("[scan_directory] Scan completed: scanned={}, imported={}, skipped={}",
-                r.scanned_count, r.imported_count, r.skipped_count);
-            let _ = handle.emit("scan_complete", serde_json::json!({ "total": r.imported_count }));
+            log::info!(
+                "[scan_directory] Scan completed: scanned={}, imported={}, skipped={}",
+                r.scanned_count,
+                r.imported_count,
+                r.skipped_count
+            );
+            let _ = handle.emit(
+                "scan_complete",
+                serde_json::json!({ "total": r.imported_count }),
+            );
         }
         Err(e) => log::error!("[scan_directory] Final error: {}", e),
     }
@@ -744,7 +1002,12 @@ pub async fn get_media_files(
     let safe_page = page.max(1);
     let safe_per_page = per_page.clamp(1, 200);
 
-    log::debug!("[get_media_files] querying page={} perPage={} cursor={:?}", safe_page, safe_per_page, cursor.as_ref().map(|c| &c.id));
+    log::debug!(
+        "[get_media_files] querying page={} perPage={} cursor={:?}",
+        safe_page,
+        safe_per_page,
+        cursor.as_ref().map(|c| &c.id)
+    );
 
     let library_root = library_root(&handle).unwrap_or_default();
     log::debug!("[get_media_files] library_root={}", library_root);
@@ -754,14 +1017,25 @@ pub async fn get_media_files(
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
         let mut filter_with_root = filter.clone();
         filter_with_root.library_root_path = Some(library_root);
-        let (items, total, next_cursor) =
-            crud::query_media_files(&conn, safe_page, safe_per_page, &filter_with_root, cursor.as_ref(), safe_page > 1).map_err(|e| e.to_string())?;
-        log::debug!("[get_media_files] result count={} next_cursor={}", items.len(), next_cursor.is_some());
+        let (items, total, next_cursor) = crud::query_media_files(
+            &conn,
+            safe_page,
+            safe_per_page,
+            &filter_with_root,
+            cursor.as_ref(),
+            safe_page > 1,
+        )
+        .map_err(|e| e.to_string())?;
+        log::debug!(
+            "[get_media_files] result count={} next_cursor={}",
+            items.len(),
+            next_cursor.is_some()
+        );
         Ok(MediaPage {
             items,
             total,
             page,
-            per_page,
+            per_page: safe_per_page,
             next_cursor,
         })
     })
@@ -774,10 +1048,16 @@ pub async fn get_media_detail(
     handle: AppHandle,
     id: String,
 ) -> Result<Option<MediaDetail>, String> {
+    let library_root = library_root(&handle).unwrap_or_default();
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
-        crud::get_media_detail(&conn, &id).map_err(|e| e.to_string())
+        let root_opt = if library_root.trim().is_empty() {
+            None
+        } else {
+            Some(library_root.as_str())
+        };
+        crud::get_media_detail(&conn, &id, root_opt).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -789,10 +1069,14 @@ pub async fn get_group_item_counts(
     filter: MediaFilter,
     group_names: Vec<String>,
 ) -> Result<Vec<GroupItemCount>, String> {
+    let library_root = library_root(&handle).unwrap_or_default();
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
-        crud::get_group_item_counts(&conn, &filter, &group_names).map_err(|e| e.to_string())
+        let mut filter_with_root = filter;
+        filter_with_root.library_root_path = Some(library_root);
+        crud::get_group_item_counts(&conn, &filter_with_root, &group_names)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -807,7 +1091,8 @@ pub async fn get_nav_item_counts(
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
-        crud::get_nav_item_counts(&conn, &nav_ids, library_root.as_deref()).map_err(|e| e.to_string())
+        crud::get_nav_item_counts(&conn, &nav_ids, library_root.as_deref())
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -856,19 +1141,30 @@ fn read_pending_import_preview_data_url(path: &str) -> Result<String, String> {
         .map(|ext| ext.to_ascii_lowercase())
         .ok_or_else(|| "preview_unavailable".to_string())?;
 
-    if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "avif") {
+    if !matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "avif"
+    ) {
         return Err("preview_unavailable".to_string());
     }
 
-    let metadata = std::fs::symlink_metadata(&path_buf).map_err(|_| "preview_unavailable".to_string())?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() || metadata.len() > 8 * 1024 * 1024 {
+    let metadata =
+        std::fs::symlink_metadata(&path_buf).map_err(|_| "preview_unavailable".to_string())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.len() > 8 * 1024 * 1024
+    {
         return Err("preview_unavailable".to_string());
     }
 
     let file = std::fs::File::open(&path_buf).map_err(|_| "preview_unavailable".to_string())?;
     let reader = std::io::BufReader::new(file);
-    let image = image::load(reader, image::ImageFormat::from_extension(&ext).ok_or_else(|| "preview_unavailable".to_string())?)
-        .map_err(|_| "preview_unavailable".to_string())?;
+    let image = image::load(
+        reader,
+        image::ImageFormat::from_extension(&ext)
+            .ok_or_else(|| "preview_unavailable".to_string())?,
+    )
+    .map_err(|_| "preview_unavailable".to_string())?;
 
     let width = image.width();
     let height = image.height();
@@ -887,7 +1183,8 @@ fn read_pending_import_preview_data_url(path: &str) -> Result<String, String> {
     };
 
     let rgba = resized.to_rgba8();
-    encode_rgba_preview_data_url(rgba.width(), rgba.height(), rgba.as_raw()).map_err(|_| "preview_unavailable".to_string())
+    encode_rgba_preview_data_url(rgba.width(), rgba.height(), rgba.as_raw())
+        .map_err(|_| "preview_unavailable".to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -961,7 +1258,10 @@ fn shell_thumbnail_preview_data_url(path: &str, size: u32) -> Result<Option<Stri
     } else if hr == HRESULT(0x80010106u32 as i32) {
         false
     } else {
-        return Err(format!("Failed to initialize COM for shell thumbnail: {}", hr));
+        return Err(format!(
+            "Failed to initialize COM for shell thumbnail: {}",
+            hr
+        ));
     };
 
     let result = (|| {
@@ -996,7 +1296,22 @@ fn shell_thumbnail_preview_data_url(path: &str, size: u32) -> Result<Option<Stri
     result
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn shell_thumbnail_preview_data_url(path: &str, size: u32) -> Result<Option<String>, String> {
+    let preview_size = size.clamp(96, 1024);
+    let resolved = crate::media::path_util::resolve_regular_file_path(path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    match crate::media::os_preview::fetch_os_preview_bytes(&resolved, preview_size) {
+        Some(bytes) => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Ok(Some(format!("data:image/png;base64,{}", encoded)))
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn shell_thumbnail_preview_data_url(_path: &str, _size: u32) -> Result<Option<String>, String> {
     Ok(None)
 }
@@ -1047,7 +1362,11 @@ pub async fn add_media_attachments(
     let scope = handle.asset_protocol_scope();
     for path in &scope_paths {
         if let Err(e) = scope.allow_file(std::path::Path::new(path)) {
-            log::warn!("[add_media_attachments] Failed to allow attachment in asset scope: {} - {}", path, e);
+            log::warn!(
+                "[add_media_attachments] Failed to allow attachment in asset scope: {} - {}",
+                path,
+                e
+            );
         }
     }
 
@@ -1075,19 +1394,27 @@ pub async fn remove_media_attachment(
             |row| row.get::<_, String>(0),
         ) {
             // Check if the attachment file lives outside the current library root.
-            let is_external = lib_root.as_ref().map(|root| {
-                !std::path::Path::new(&filepath)
-                    .starts_with(std::path::Path::new(root))
-            }).unwrap_or(false);
+            let is_external = lib_root
+                .as_ref()
+                .map(|root| {
+                    !std::path::Path::new(&filepath).starts_with(std::path::Path::new(root))
+                })
+                .unwrap_or(false);
 
             if is_external {
                 // Only revoke when no other attachment row still references this path.
-                let ref_count: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM media_attachments WHERE filepath = ? AND id != ?",
-                    rusqlite::params![&filepath, &attachment_id],
-                    |row| row.get(0),
-                ).unwrap_or(1); // default to 1 (keep allowed) on DB error
-                if ref_count == 0 { Some(filepath) } else { None }
+                let ref_count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM media_attachments WHERE filepath = ? AND id != ?",
+                        rusqlite::params![&filepath, &attachment_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(1); // default to 1 (keep allowed) on DB error
+                if ref_count == 0 {
+                    Some(filepath)
+                } else {
+                    None
+                }
             } else {
                 None // inside library root; directory scope covers it
             }
@@ -1106,8 +1433,15 @@ pub async fn remove_media_attachment(
 
     // Revoke asset scope for external files that are no longer referenced.
     if let Some(filepath) = revoke_path {
-        if let Err(e) = handle.asset_protocol_scope().forbid_file(std::path::Path::new(&filepath)) {
-            log::warn!("[remove_media_attachment] Failed to revoke asset scope for {}: {}", filepath, e);
+        if let Err(e) = handle
+            .asset_protocol_scope()
+            .forbid_file(std::path::Path::new(&filepath))
+        {
+            log::warn!(
+                "[remove_media_attachment] Failed to revoke asset scope for {}: {}",
+                filepath,
+                e
+            );
         }
     }
 
@@ -1125,6 +1459,150 @@ pub async fn get_attachment_preview_data(
         .map_err(|e| format!("Task join error: {}", e))?
 }
 
+fn design_preview_already_complete(file: &crate::models::MediaFile) -> bool {
+    crate::media::design_source::has_modern_webp_tiers(
+        file.thumbnail_micro_path.as_deref(),
+        file.thumbnail_path.as_deref(),
+        file.thumbnail_preview_path.as_deref(),
+    )
+}
+
+/// 为 PSD 等设计源文件补生成缩略图（内嵌预览 / macOS Quick Look），并写回 DB。
+#[command]
+pub async fn ensure_media_preview_thumbnails(
+    handle: AppHandle,
+    media_id: String,
+) -> Result<Option<crate::models::MediaFile>, String> {
+    let db = db_path(&handle)?;
+    let library_root = library_root(&handle).unwrap_or_default();
+    eprintln!("[ensure_media_preview_thumbnails] invoked id={}", media_id);
+    tokio::task::spawn_blocking(move || {
+        let conn = open_conn(&db).map_err(|e| e.to_string())?;
+        let file = crud::get_media_file_by_id(&conn, &media_id).map_err(|e| e.to_string())?;
+        eprintln!(
+            "[ensure_media_preview_thumbnails] file={} type={} thumb={:?} micro={:?}",
+            file.filename,
+            file.filetype,
+            file.thumbnail_path,
+            file.thumbnail_micro_path
+        );
+
+        let root_opt = library_root.trim();
+        let library_root_opt = if root_opt.is_empty() { None } else { Some(root_opt) };
+        let folder_hint = file
+            .source_folder
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let resolved = crate::media::path_util::resolve_media_file_on_disk_with_folder_hint(
+            &file.filepath,
+            library_root_opt,
+            Some(&file.filename),
+            folder_hint,
+        );
+        let Some(resolved_path) = resolved else {
+            eprintln!(
+                "[ensure_media_preview_thumbnails] skip (not on disk): {} (library_root={:?} folder={:?})",
+                file.filepath,
+                library_root_opt,
+                folder_hint
+            );
+            return Ok(Some(file));
+        };
+        let disk_path = resolved_path.to_string_lossy().to_string();
+        if disk_path != file.filepath {
+            eprintln!(
+                "[ensure_media_preview_thumbnails] resolved path: {} -> {}",
+                file.filepath, disk_path
+            );
+            if !library_root.trim().is_empty() {
+                let _ = crate::media::library_sync::apply_repaired_media_path(
+                    &conn,
+                    &media_id,
+                    &disk_path,
+                    library_root.trim(),
+                );
+            } else {
+                let _ = conn.execute(
+                    "UPDATE media_files SET filepath = ?1 WHERE id = ?2",
+                    rusqlite::params![disk_path, media_id],
+                );
+            }
+        }
+
+        let _ = crate::media::design_source::hydrate_db_thumbnails_from_sidecar(
+            &conn,
+            &media_id,
+            &resolved_path,
+            &file.filename,
+        );
+
+        let file = crud::get_media_file_by_id(&conn, &media_id).map_err(|e| e.to_string())?;
+        if design_preview_already_complete(&file) {
+            eprintln!("[ensure_media_preview_thumbnails] ok (sidecar or DB already has tiers)");
+            return Ok(Some(file));
+        }
+
+        let ext = crate::media::design_source::ext_lower_from_path(&resolved_path);
+        let meta_dir = resolved_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(".nocturne_meta");
+
+        if !crate::media::design_source::needs_source_preview_for_filetype_and_ext(
+            &file.filetype,
+            &ext,
+        ) {
+            eprintln!(
+                "[ensure_media_preview_thumbnails] skip (not a previewable source): type={} ext={}",
+                file.filetype, ext
+            );
+        } else {
+            eprintln!(
+                "[ensure_media_preview_thumbnails] running source preview pipeline (ext={})...",
+                ext
+            );
+            match crate::media::design_source::ensure_source_preview_thumbnails(
+                &media_id,
+                &disk_path,
+                &file.filename,
+                &meta_dir,
+                &db,
+                &file.filetype,
+                &ext,
+            ) {
+                Some(p) => eprintln!("[ensure_media_preview_thumbnails] ok: {}", p),
+                None => eprintln!("[ensure_media_preview_thumbnails] failed (no preview source)"),
+            }
+        }
+
+        let updated = crud::get_media_file_by_id(&conn, &media_id).map_err(|e| e.to_string())?;
+        eprintln!(
+            "[ensure_media_preview_thumbnails] done thumb={:?} micro={:?}",
+            updated.thumbnail_path,
+            updated.thumbnail_micro_path
+        );
+        Ok(Some(updated))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
+    .map(|opt| {
+        if let Some(ref updated) = opt {
+            if crate::media::design_source::has_modern_webp_tiers(
+                updated.thumbnail_micro_path.as_deref(),
+                updated.thumbnail_path.as_deref(),
+                updated.thumbnail_preview_path.as_deref(),
+            ) {
+                let _ = handle.emit(
+                    "media_metadata_updated",
+                    serde_json::json!({ "id": updated.id }),
+                );
+            }
+        }
+        opt
+    })
+}
+
 #[command]
 pub async fn read_media_file_as_base64(
     handle: AppHandle,
@@ -1133,8 +1611,7 @@ pub async fn read_media_file_as_base64(
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
-        let file = crud::get_media_file_by_id(&conn, &media_id)
-            .map_err(|e| e.to_string())?;
+        let file = crud::get_media_file_by_id(&conn, &media_id).map_err(|e| e.to_string())?;
         read_supported_ai_input_file_base64(&file.filepath, "媒体文件")
     })
     .await
@@ -1172,19 +1649,29 @@ pub async fn read_attachment_preview(
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
-        let filepath: String = conn.query_row(
-            "SELECT filepath FROM media_attachments WHERE id = ?",
-            rusqlite::params![attachment_id],
-            |row| row.get(0),
-        ).map_err(|_| "preview_unavailable".to_string())?;
+        let filepath: String = conn
+            .query_row(
+                "SELECT filepath FROM media_attachments WHERE id = ?",
+                rusqlite::params![attachment_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "preview_unavailable".to_string())?;
 
         let path = std::path::Path::new(&filepath);
-        let metadata = std::fs::symlink_metadata(path).map_err(|_| "preview_unavailable".to_string())?;
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|_| "preview_unavailable".to_string())?;
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
             return Err("preview_unavailable".to_string());
         }
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-        if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "avif") {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            ext.as_str(),
+            "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "avif"
+        ) {
             if metadata.len() > 15 * 1024 * 1024 {
                 return Err("preview_unavailable".to_string());
             }
@@ -1198,11 +1685,23 @@ pub async fn read_attachment_preview(
             let mut out = Vec::new();
             let rgba = resized.to_rgba8();
             let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut out);
-            encoder.encode(&rgba, rgba.width(), rgba.height(), image::ExtendedColorType::Rgba8).map_err(|_| "preview_unavailable".to_string())?;
-            return Ok(format!("data:image/webp;base64,{}", base64::engine::general_purpose::STANDARD.encode(out)));
+            encoder
+                .encode(
+                    &rgba,
+                    rgba.width(),
+                    rgba.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|_| "preview_unavailable".to_string())?;
+            return Ok(format!(
+                "data:image/webp;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(out)
+            ));
         }
 
-        match shell_thumbnail_preview_data_url(&filepath, 320).map_err(|_| "preview_unavailable".to_string())? {
+        match shell_thumbnail_preview_data_url(&filepath, 320)
+            .map_err(|_| "preview_unavailable".to_string())?
+        {
             Some(preview) => Ok(preview),
             None => Err("preview_unavailable".to_string()),
         }
@@ -1235,11 +1734,7 @@ pub async fn update_ai_metadata(
 
 /// æ›´æ–°åª’ä½“æ–‡ä»¶çš„æ ‡ç­¾ï¼ˆå…¨é‡æ›¿æ¢ï¼‰ã€‚
 #[command]
-pub async fn update_tags(
-    handle: AppHandle,
-    id: String,
-    tags: Vec<String>,
-) -> Result<(), String> {
+pub async fn update_tags(handle: AppHandle, id: String, tags: Vec<String>) -> Result<(), String> {
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
         let mut conn = open_conn(&db).map_err(|e| e.to_string())?;
@@ -1249,7 +1744,10 @@ pub async fn update_tags(
         crud::update_media_tags(&tx, &id, &tags).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
 
-        log::info!("[update_tags] Database updated, now syncing JSON for {}", id);
+        log::info!(
+            "[update_tags] Database updated, now syncing JSON for {}",
+            id
+        );
 
         // 同步标签到侧边元数据 JSON 文件
         let file_info: Option<(String, String)> = conn
@@ -1259,10 +1757,13 @@ pub async fn update_tags(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .ok();
-            
+
         if let Some((filepath, filename)) = file_info {
             let file_path = std::path::Path::new(&filepath);
-            let meta_dir = file_path.parent().unwrap_or(std::path::Path::new(".")).join(".nocturne_meta");
+            let meta_dir = file_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join(".nocturne_meta");
 
             // 优先新格式（{filename}.json），回退旧格式（{file_stem}.json）
             let new_path = meta_dir.join(format!("{}.json", filename));
@@ -1278,7 +1779,9 @@ pub async fn update_tags(
 
             if meta_json_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&meta_json_path) {
-                    if let Ok(mut meta) = serde_json::from_str::<crate::models::FileMetaJSON>(&content) {
+                    if let Ok(mut meta) =
+                        serde_json::from_str::<crate::models::FileMetaJSON>(&content)
+                    {
                         meta.tags = Some(tags);
                         if let Ok(updated_content) = serde_json::to_string_pretty(&meta) {
                             if let Err(e) = std::fs::write(&meta_json_path, updated_content) {
@@ -1289,7 +1792,7 @@ pub async fn update_tags(
                 }
             }
         }
-        
+
         Ok(())
     })
     .await
@@ -1297,7 +1800,11 @@ pub async fn update_tags(
 }
 
 #[command]
-pub async fn rename_file(handle: AppHandle, id: String, new_name: String) -> Result<MediaFile, String> {
+pub async fn rename_file(
+    handle: AppHandle,
+    id: String,
+    new_name: String,
+) -> Result<MediaFile, String> {
     let db = db_path(&handle)?;
     let library_root = library_root(&handle)?;
 
@@ -1350,16 +1857,15 @@ pub async fn rename_file(handle: AppHandle, id: String, new_name: String) -> Res
             return Err("暂不支持修改文件扩展名".to_string());
         }
 
-        std::fs::rename(source_path, &target_path)
-            .map_err(|e| format!("重命名文件失败: {}", e))?;
+        std::fs::rename(source_path, &target_path).map_err(|e| format!("重命名文件失败: {}", e))?;
 
         let meta_dir = parent_dir.join(".nocturne_meta");
-        let old_meta_path = find_meta_json_path(&meta_dir, &current_file.filename);
+        let old_meta_path = media_bundle::find_meta_json_path(&meta_dir, &current_file.filename);
         let new_meta_path = meta_dir.join(format!("{}.json", sanitized_name));
         let mut wrote_new_meta = false;
 
         if let Some(existing_meta_path) = old_meta_path.as_ref() {
-            match update_meta_json_filename(existing_meta_path, sanitized_name) {
+            match media_bundle::update_meta_json_filename(existing_meta_path, sanitized_name) {
                 Ok(updated_meta) => {
                     if let Err(error) = std::fs::write(&new_meta_path, updated_meta) {
                         log::warn!(
@@ -1391,13 +1897,9 @@ pub async fn rename_file(handle: AppHandle, id: String, new_name: String) -> Res
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(current_file.modified_at);
 
-        if let Err(error) = crud::rename_media_file(
-            &conn,
-            &id,
-            sanitized_name,
-            &target_path_str,
-            modified_at,
-        ) {
+        if let Err(error) =
+            crud::rename_media_file(&conn, &id, sanitized_name, &target_path_str, modified_at)
+        {
             let rollback_file_result = std::fs::rename(&target_path, source_path);
 
             if wrote_new_meta {
@@ -1460,55 +1962,77 @@ pub async fn move_to_trash(handle: AppHandle, id: String) -> Result<(), String> 
     let db = db_path(&handle)?;
 
     // First get the file info
-    let (source_path, filename) = tokio::task::spawn_blocking({
+    let (stored_path, filename, source_folder) = tokio::task::spawn_blocking({
         let db_clone = db.clone();
         let id_clone = id.clone();
+        let root_clone = library_root.clone();
         move || {
             let conn = open_conn(&db_clone).map_err(|e| e.to_string())?;
+            let _ = crate::media::path_util::relink_media_filepaths_in_db(&conn, &root_clone);
 
-            // Get the current file path
-            let filepath: String = conn
-                .query_row(
-                    "SELECT filepath FROM media_files WHERE id = ?",
-                    rusqlite::params![id_clone],
-                    |r| r.get(0),
-                )
-                .map_err(|e| format!("Media file not found: {}", e))?;
-
-            let filename = std::path::Path::new(&filepath)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or("Invalid file path")?
-                .to_string();
-
-            Ok((filepath, filename))
+            conn.query_row(
+                "SELECT filepath, filename, COALESCE(source_folder, '') FROM media_files WHERE id = ?",
+                rusqlite::params![id_clone],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| format!("Media file not found: {}", e))
         }
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
     .map_err(|e: String| e)?;
 
-    eprintln!("[move_to_trash] Source path: {}, filename: {}", source_path, filename);
-    validate_path_in_library(&source_path, &library_root)?;
+    let resolved =
+        resolve_library_media_on_disk(&stored_path, &filename, &source_folder, &library_root);
+    eprintln!(
+        "[move_to_trash] Stored: {}, resolved: {:?}, filename: {}",
+        stored_path,
+        resolved.as_ref().map(|p| p.display().to_string()),
+        filename
+    );
 
-    // Move the file to the trash folder
-    let target_folder = validate_library_relative_folder("回收站")?;
-    let target_path = std::path::Path::new(&library_root)
-        .join(&target_folder)
-        .join(&filename);
+    let target_folder = validate_library_relative_folder(TRASH_FOLDER_NAME)?;
+    let trash_dir = std::path::Path::new(&library_root).join(&target_folder);
+    std::fs::create_dir_all(&trash_dir)
+        .map_err(|e| format!("Failed to create trash folder: {}", e))?;
+
+    let source_path_buf = match resolved {
+        Some(buf) if is_movable_library_entry(&buf) => {
+            validate_path_in_library(&buf.to_string_lossy(), &library_root)?;
+            buf
+        }
+        _ => {
+            return Err(format!(
+                "无法在磁盘上找到文件，未移入回收站（记录：{}）。请在 Finder 中打开库根「{}」下的「回收站」文件夹查看；若文件已被手动删除，请从回收站永久删除该记录。",
+                stored_path, library_root
+            ));
+        }
+    };
+    let source_path = source_path_buf.to_string_lossy().to_string();
+
+    let target_path = unique_path_in_dir(&trash_dir, &filename);
 
     let target_path_str = target_path.to_string_lossy().to_string();
     validate_path_in_library(&target_path_str, &library_root)?;
     eprintln!("[move_to_trash] Target path: {}", target_path_str);
 
-    // Ensure target folder exists
-    std::fs::create_dir_all(std::path::Path::new(&library_root).join(&target_folder))
-        .map_err(|e| format!("Failed to create trash folder: {}", e))?;
+    let source_path_clone = source_path.clone();
+    let filename_for_meta = filename.clone();
+    let new_filename = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&filename)
+        .to_string();
 
     // Move the file physically
     tokio::task::spawn_blocking(move || {
-        std::fs::rename(&source_path, &target_path)
-            .map_err(|e| format!("Failed to move file to trash: {}", e))
+        move_file_within_library(std::path::Path::new(&source_path_clone), &target_path)
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -1517,25 +2041,46 @@ pub async fn move_to_trash(handle: AppHandle, id: String) -> Result<(), String> 
         e
     })?;
 
+    if !std::path::Path::new(&target_path_str).is_file() {
+        return Err(format!("文件移动后未出现在回收站目录：{}", target_path_str));
+    }
+
     eprintln!("[move_to_trash] File moved to trash successfully");
 
     // Update database: update path and set is_trashed flag
     let db = db_path(&handle)?;
+    let target_path_str_db = target_path_str.clone();
+    let target_folder_db = target_folder.clone();
+    let new_filename_db = new_filename.clone();
+    let library_root_db = library_root.clone();
+    let source_path_db = source_path.clone();
+    let filename_for_meta_db = filename_for_meta.clone();
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
 
-        let original_folder = conn
+        let (pre_trash_raw, current_source): (String, String) = conn
             .query_row(
-                "SELECT COALESCE(source_folder, '') FROM media_files WHERE id = ?",
+                "SELECT COALESCE(pre_trash_folder, ''), COALESCE(source_folder, '') FROM media_files WHERE id = ?",
                 rusqlite::params![id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .unwrap_or_else(|_| String::new());
+            .unwrap_or_else(|_| (String::new(), String::new()));
+        let pre_trash = restore_folder_for_trash_item(&pre_trash_raw, &current_source);
+
+        relocate_bundle_after_move(
+            &conn,
+            &id,
+            &source_path_db,
+            &target_path_str_db,
+            &filename_for_meta_db,
+            &new_filename_db,
+            &library_root_db,
+        );
 
         // Update the file path and is_trashed flag
         conn.execute(
-            "UPDATE media_files SET filepath = ?, source_folder = ?, pre_trash_folder = ?, is_trashed = 1 WHERE id = ?",
-            rusqlite::params![target_path_str, target_folder, original_folder, id],
+            "UPDATE media_files SET filepath = ?, filename = ?, source_folder = ?, pre_trash_folder = ?, is_trashed = 1 WHERE id = ?",
+            rusqlite::params![target_path_str_db, new_filename_db, target_folder_db, pre_trash, id],
         )
         .map_err(|e| format!("Failed to update database: {}", e))?;
 
@@ -1558,7 +2103,11 @@ pub async fn batch_move_to_trash(
     ids: Vec<String>,
 ) -> Result<BatchFileOperationResult, String> {
     if ids.is_empty() {
-        return Ok(BatchFileOperationResult { succeeded: 0, failed: 0 });
+        return Ok(BatchFileOperationResult {
+            succeeded: 0,
+            failed: 0,
+            first_error: None,
+        });
     }
 
     let library_root = library_root(&handle)?;
@@ -1566,77 +2115,158 @@ pub async fn batch_move_to_trash(
 
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
+        let _ = crate::media::path_util::relink_media_filepaths_in_db(&conn, &library_root);
         let rows = query_file_records(
             &conn,
             &ids,
-            "SELECT id, filepath, COALESCE(source_folder, '') FROM media_files WHERE id IN ({placeholders})",
+            "SELECT id, filepath, COALESCE(pre_trash_folder, ''), COALESCE(source_folder, ''), filename FROM media_files WHERE id IN ({placeholders})",
         )?;
-        let file_map: HashMap<String, (String, String)> = rows
+        let file_map: HashMap<String, (String, String, String, String)> = rows
             .into_iter()
             .filter_map(|row| {
-                if row.len() == 3 {
-                    Some((row[0].clone(), (row[1].clone(), row[2].clone())))
+                if row.len() == 5 {
+                    Some((
+                        row[0].clone(),
+                        (
+                            row[1].clone(),
+                            row[2].clone(),
+                            row[3].clone(),
+                            row[4].clone(),
+                        ),
+                    ))
                 } else {
                     None
                 }
             })
             .collect();
 
-        let target_folder = validate_library_relative_folder("回收站")?;
-        std::fs::create_dir_all(std::path::Path::new(&library_root).join(&target_folder))
+        let target_folder = validate_library_relative_folder(TRASH_FOLDER_NAME)?;
+        let trash_dir = std::path::Path::new(&library_root).join(&target_folder);
+        std::fs::create_dir_all(&trash_dir)
             .map_err(|e| format!("Failed to create trash folder: {}", e))?;
 
-        let mut moved_items: Vec<(String, String, String)> = Vec::new();
+        let mut moved_items: Vec<(String, String, String, String, String, String)> = Vec::new();
         let mut failed = 0usize;
+        let mut first_error: Option<String> = None;
 
         for id in &ids {
-            let Some((source_path, source_folder)) = file_map.get(id) else {
-                failed += 1;
-                continue;
-            };
-
-            if validate_path_in_library(source_path, &library_root).is_err() {
-                failed += 1;
-                continue;
-            }
-
-            let Some(filename) = std::path::Path::new(source_path)
-                .file_name()
-                .and_then(|name| name.to_str())
+            let Some((stored_path, pre_trash_raw, current_source, db_filename)) = file_map.get(id)
             else {
                 failed += 1;
+                record_fail(&mut first_error, "未找到该素材记录");
                 continue;
             };
 
-            let target_path = std::path::Path::new(&library_root)
-                .join(&target_folder)
-                .join(filename);
-            let target_path_str = target_path.to_string_lossy().to_string();
-            if validate_path_in_library(&target_path_str, &library_root).is_err() {
-                failed += 1;
+            let resolved = resolve_library_media_on_disk(
+                stored_path,
+                db_filename,
+                current_source,
+                &library_root,
+            );
+
+            if let Some(ref source_path_buf) = resolved {
+                if !is_movable_library_entry(source_path_buf) {
+                    failed += 1;
+                    record_fail(
+                        &mut first_error,
+                        format!("无法访问文件：{}", db_filename),
+                    );
+                    continue;
+                }
+                if !path_allowed_for_trash_op(stored_path, Some(source_path_buf.as_path()), &library_root)
+                {
+                    failed += 1;
+                    record_fail(&mut first_error, "路径不在库目录内");
+                    continue;
+                }
+
+                let source_path = source_path_buf.to_string_lossy().to_string();
+                let filename = source_path_buf
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(db_filename.as_str());
+
+                let target_path = unique_path_in_dir(&trash_dir, filename);
+                let target_path_str = target_path.to_string_lossy().to_string();
+                if validate_path_in_library(&target_path_str, &library_root).is_err() {
+                    failed += 1;
+                    record_fail(&mut first_error, "回收站目标路径无效");
+                    continue;
+                }
+
+                let new_filename = target_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(filename)
+                    .to_string();
+
+                match move_file_within_library(source_path_buf, &target_path) {
+                    Ok(()) => {
+                        if !target_path.is_file() {
+                            failed += 1;
+                            record_fail(
+                                &mut first_error,
+                                format!("移动后磁盘上找不到：{}", target_path_str),
+                            );
+                            continue;
+                        }
+                        if source_path != *stored_path {
+                            let _ = conn.execute(
+                                "UPDATE media_files SET filepath = ?1 WHERE id = ?2",
+                                rusqlite::params![&source_path, id],
+                            );
+                        }
+                        relocate_bundle_after_move(
+                            &conn,
+                            id,
+                            &source_path,
+                            &target_path_str,
+                            filename,
+                            &new_filename,
+                            &library_root,
+                        );
+                        let pre_trash =
+                            restore_folder_for_trash_item(pre_trash_raw, current_source);
+                        moved_items.push((
+                            id.clone(),
+                            source_path.clone(),
+                            target_path_str,
+                            pre_trash,
+                            new_filename,
+                            filename.to_string(),
+                        ));
+                    }
+                    Err(error) => {
+                        log::warn!("[batch_move_to_trash] Failed to move {}: {}", source_path, error);
+                        failed += 1;
+                        record_fail(&mut first_error, error);
+                    }
+                }
                 continue;
             }
 
-            match std::fs::rename(source_path, &target_path) {
-                Ok(_) => moved_items.push((
-                    id.clone(),
-                    target_path_str,
-                    source_folder.clone(),
-                )),
-                Err(error) => {
-                    log::warn!("[batch_move_to_trash] Failed to move {}: {}", source_path, error);
-                    failed += 1;
-                }
-            }
+            log::warn!(
+                "[batch_move_to_trash] Source missing (stored={}, folder={})",
+                stored_path,
+                current_source
+            );
+            failed += 1;
+            record_fail(
+                &mut first_error,
+                format!(
+                    "无法在磁盘找到「{}」，未移入回收站（避免仅改数据库）。请检查库根下的文件是否还在原文件夹。",
+                    db_filename
+                ),
+            );
         }
 
         if !moved_items.is_empty() {
             let mut conn = open_conn(&db).map_err(|e| e.to_string())?;
             let tx = conn.transaction().map_err(|e| e.to_string())?;
-            for (id, target_path, source_folder) in &moved_items {
+            for (id, _old_path, target_path, pre_trash, new_name, _old_name) in &moved_items {
                 tx.execute(
-                    "UPDATE media_files SET filepath = ?, source_folder = ?, pre_trash_folder = ?, is_trashed = 1 WHERE id = ?",
-                    rusqlite::params![target_path, &target_folder, source_folder, id],
+                    "UPDATE media_files SET filepath = ?, filename = ?, source_folder = ?, pre_trash_folder = ?, is_trashed = 1 WHERE id = ?",
+                    rusqlite::params![target_path, new_name, &target_folder, pre_trash, id],
                 )
                 .map_err(|e| format!("Failed to update database: {}", e))?;
             }
@@ -1646,6 +2276,7 @@ pub async fn batch_move_to_trash(
         Ok(BatchFileOperationResult {
             succeeded: moved_items.len(),
             failed,
+            first_error,
         })
     })
     .await
@@ -1661,31 +2292,37 @@ pub async fn restore_from_trash(handle: AppHandle, id: String) -> Result<(), Str
     let db = db_path(&handle)?;
 
     // Get the current trashed file info and determine original folder
-    let (current_path, original_source_folder) = tokio::task::spawn_blocking({
+    let (current_path, pre_trash_raw, current_source_folder) = tokio::task::spawn_blocking({
         let db_clone = db.clone();
         let id_clone = id.clone();
         move || {
             let conn = open_conn(&db_clone).map_err(|e| e.to_string())?;
 
-            // Get the current file path (in trash) and original source folder
-            let mut stmt = conn.prepare(
-                "SELECT filepath, COALESCE(pre_trash_folder, source_folder, '') FROM media_files WHERE id = ?",
-            ).map_err(|e| e.to_string())?;
-
-            let (filepath, source_folder): (String, String) = stmt.query_row([id_clone], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            }).map_err(|e| format!("Media file not found: {}", e))?;
-
-            Ok((filepath, source_folder))
+            conn.query_row(
+                "SELECT filepath, COALESCE(pre_trash_folder, ''), COALESCE(source_folder, '') FROM media_files WHERE id = ?",
+                rusqlite::params![id_clone],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| format!("Media file not found: {}", e))
         }
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
     .map_err(|e: String| e)?;
 
-    eprintln!("[restore_from_trash] Current path: {}, original folder: {}", current_path, original_source_folder);
+    let restore_folder = restore_folder_for_trash_item(&pre_trash_raw, &current_source_folder);
+    eprintln!(
+        "[restore_from_trash] Current path: {}, restore to folder: {}",
+        current_path, restore_folder
+    );
     validate_path_in_library(&current_path, &library_root)?;
-    let original_source_folder = validate_library_relative_folder(&original_source_folder)?;
+    let original_source_folder = validate_library_relative_folder(&restore_folder)?;
 
     // Determine target path based on original source folder
     let filename = std::path::Path::new(&current_path)
@@ -1694,22 +2331,26 @@ pub async fn restore_from_trash(handle: AppHandle, id: String) -> Result<(), Str
         .ok_or("Invalid file path")?
         .to_string();
 
-    let target_path = std::path::Path::new(&library_root)
-        .join(&original_source_folder)
-        .join(&filename);
+    let target_dir = std::path::Path::new(&library_root).join(&original_source_folder);
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| format!("Failed to create target folder: {}", e))?;
+    let target_path = unique_path_in_dir(&target_dir, &filename);
 
     let target_path_str = target_path.to_string_lossy().to_string();
     validate_path_in_library(&target_path_str, &library_root)?;
     eprintln!("[restore_from_trash] Target path: {}", target_path_str);
 
-    // Ensure target folder exists
-    std::fs::create_dir_all(std::path::Path::new(&library_root).join(&original_source_folder))
-        .map_err(|e| format!("Failed to create target folder: {}", e))?;
+    let current_path_move = current_path.clone();
+    let filename_meta = filename.clone();
+    let new_filename = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&filename)
+        .to_string();
 
     // Move the file back from trash
     tokio::task::spawn_blocking(move || {
-        std::fs::rename(&current_path, &target_path)
-            .map_err(|e| format!("Failed to move file from trash: {}", e))
+        move_file_within_library(std::path::Path::new(&current_path_move), &target_path)
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -1722,13 +2363,29 @@ pub async fn restore_from_trash(handle: AppHandle, id: String) -> Result<(), Str
 
     // Update database: update path and clear is_trashed flag
     let db = db_path(&handle)?;
+    let target_path_str_db = target_path_str.clone();
+    let original_source_folder_db = original_source_folder.clone();
+    let new_filename_db = new_filename.clone();
+    let library_root_db = library_root.clone();
+    let current_path_db = current_path.clone();
+    let filename_meta_db = filename_meta.clone();
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
 
+        relocate_bundle_after_move(
+            &conn,
+            &id,
+            &current_path_db,
+            &target_path_str_db,
+            &filename_meta_db,
+            &new_filename_db,
+            &library_root_db,
+        );
+
         // Update the file path and clear is_trashed flag
         conn.execute(
-            "UPDATE media_files SET filepath = ?, source_folder = ?, pre_trash_folder = NULL, is_trashed = 0 WHERE id = ?",
-            rusqlite::params![target_path_str, original_source_folder, id],
+            "UPDATE media_files SET filepath = ?, filename = ?, source_folder = ?, pre_trash_folder = NULL, is_trashed = 0 WHERE id = ?",
+            rusqlite::params![target_path_str_db, new_filename_db, original_source_folder_db, id],
         )
         .map_err(|e| format!("Failed to update database: {}", e))?;
 
@@ -1751,7 +2408,11 @@ pub async fn batch_restore_from_trash(
     ids: Vec<String>,
 ) -> Result<BatchFileOperationResult, String> {
     if ids.is_empty() {
-        return Ok(BatchFileOperationResult { succeeded: 0, failed: 0 });
+        return Ok(BatchFileOperationResult {
+            succeeded: 0,
+            failed: 0,
+            first_error: None,
+        });
     }
 
     let library_root = library_root(&handle)?;
@@ -1762,24 +2423,24 @@ pub async fn batch_restore_from_trash(
         let rows = query_file_records(
             &conn,
             &ids,
-            "SELECT id, filepath, COALESCE(pre_trash_folder, source_folder, '') FROM media_files WHERE id IN ({placeholders})",
+            "SELECT id, filepath, COALESCE(pre_trash_folder, ''), COALESCE(source_folder, '') FROM media_files WHERE id IN ({placeholders})",
         )?;
-        let file_map: HashMap<String, (String, String)> = rows
+        let file_map: HashMap<String, (String, String, String)> = rows
             .into_iter()
             .filter_map(|row| {
-                if row.len() == 3 {
-                    Some((row[0].clone(), (row[1].clone(), row[2].clone())))
+                if row.len() == 4 {
+                    Some((row[0].clone(), (row[1].clone(), row[2].clone(), row[3].clone())))
                 } else {
                     None
                 }
             })
             .collect();
 
-        let mut restored_items: Vec<(String, String, String)> = Vec::new();
+        let mut restored_items: Vec<(String, String, String, String)> = Vec::new();
         let mut failed = 0usize;
 
         for id in &ids {
-            let Some((current_path, source_folder)) = file_map.get(id) else {
+            let Some((current_path, pre_trash_raw, current_source)) = file_map.get(id) else {
                 failed += 1;
                 continue;
             };
@@ -1789,7 +2450,9 @@ pub async fn batch_restore_from_trash(
                 continue;
             }
 
-            let source_folder = match validate_library_relative_folder(source_folder) {
+            let restore_folder =
+                restore_folder_for_trash_item(pre_trash_raw, current_source);
+            let source_folder = match validate_library_relative_folder(&restore_folder) {
                 Ok(folder) => folder,
                 Err(error) => {
                     log::warn!("[batch_restore_from_trash] Invalid source folder for {}: {}", id, error);
@@ -1798,22 +2461,18 @@ pub async fn batch_restore_from_trash(
                 }
             };
 
-            let Some(filename) = std::path::Path::new(current_path)
-                .file_name()
-                .and_then(|name| name.to_str())
-            else {
+            let current = std::path::Path::new(current_path);
+            if !current.is_file() {
+                failed += 1;
+                continue;
+            }
+
+            let Some(filename) = current.file_name().and_then(|name| name.to_str()) else {
                 failed += 1;
                 continue;
             };
 
             let target_dir = std::path::Path::new(&library_root).join(&source_folder);
-            let target_path = target_dir.join(filename);
-            let target_path_str = target_path.to_string_lossy().to_string();
-            if validate_path_in_library(&target_path_str, &library_root).is_err() {
-                failed += 1;
-                continue;
-            }
-
             if let Err(error) = std::fs::create_dir_all(&target_dir) {
                 log::warn!(
                     "[batch_restore_from_trash] Failed to create target folder {}: {}",
@@ -1824,12 +2483,37 @@ pub async fn batch_restore_from_trash(
                 continue;
             }
 
-            match std::fs::rename(current_path, &target_path) {
-                Ok(_) => restored_items.push((
-                    id.clone(),
-                    target_path_str,
-                    source_folder,
-                )),
+            let target_path = unique_path_in_dir(&target_dir, filename);
+            let target_path_str = target_path.to_string_lossy().to_string();
+            if validate_path_in_library(&target_path_str, &library_root).is_err() {
+                failed += 1;
+                continue;
+            }
+
+            let new_filename = target_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(filename)
+                .to_string();
+
+            match move_file_within_library(current, &target_path) {
+                Ok(()) => {
+                    relocate_bundle_after_move(
+                        &conn,
+                        id,
+                        current_path,
+                        &target_path_str,
+                        filename,
+                        &new_filename,
+                        &library_root,
+                    );
+                    restored_items.push((
+                        id.clone(),
+                        target_path_str,
+                        source_folder,
+                        new_filename,
+                    ));
+                }
                 Err(error) => {
                     log::warn!(
                         "[batch_restore_from_trash] Failed to restore {}: {}",
@@ -1844,10 +2528,10 @@ pub async fn batch_restore_from_trash(
         if !restored_items.is_empty() {
             let mut conn = open_conn(&db).map_err(|e| e.to_string())?;
             let tx = conn.transaction().map_err(|e| e.to_string())?;
-            for (id, target_path, source_folder) in &restored_items {
+            for (id, target_path, source_folder, new_filename) in &restored_items {
                 tx.execute(
-                    "UPDATE media_files SET filepath = ?, source_folder = ?, pre_trash_folder = NULL, is_trashed = 0 WHERE id = ?",
-                    rusqlite::params![target_path, source_folder, id],
+                    "UPDATE media_files SET filepath = ?, filename = ?, source_folder = ?, pre_trash_folder = NULL, is_trashed = 0 WHERE id = ?",
+                    rusqlite::params![target_path, new_filename, source_folder, id],
                 )
                 .map_err(|e| format!("Failed to update database: {}", e))?;
             }
@@ -1857,6 +2541,7 @@ pub async fn batch_restore_from_trash(
         Ok(BatchFileOperationResult {
             succeeded: restored_items.len(),
             failed,
+            first_error: None,
         })
     })
     .await
@@ -1864,6 +2549,36 @@ pub async fn batch_restore_from_trash(
 }
 
 /// æ°¸ä¹…åˆ é™¤å›žæ“¶ç«™ä¸­çš„æ‰€æœ‰æ–‡ä»¶ï¼Œè¿“å›žè¢«åˆ é™¤çš„æ•°é‡ã€‚
+/// 对齐回收站：DB 中 is_trashed=1 的条目与 `库根/回收站/` 磁盘一致（启动时也会自动跑）。
+#[command]
+pub async fn reconcile_trash_with_disk(
+    handle: AppHandle,
+) -> Result<crate::media::trash_reconcile::TrashReconcileReport, String> {
+    let library_root = library_root(&handle)?;
+    let db = db_path(&handle)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = open_conn(&db).map_err(|e| e.to_string())?;
+        crate::media::trash_reconcile::reconcile_trashed_media_with_disk(&conn, &library_root)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
+}
+
+/// 诊断：对比 Finder 中 `库根/回收站/` 与数据库里 is_trashed=1 的记录。
+#[command]
+pub async fn get_trash_diagnostics(
+    handle: AppHandle,
+) -> Result<crate::media::trash_reconcile::TrashDiagnostics, String> {
+    let library_root = library_root(&handle)?;
+    let db = db_path(&handle)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = open_conn(&db).map_err(|e| e.to_string())?;
+        crate::media::trash_reconcile::collect_trash_diagnostics(&conn, &library_root)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
+}
+
 #[command]
 pub async fn empty_trash(handle: AppHandle) -> Result<i64, String> {
     eprintln!("[empty_trash] Emptying trash folder...");
@@ -1878,14 +2593,12 @@ pub async fn empty_trash(handle: AppHandle) -> Result<i64, String> {
             let conn = open_conn(&db_clone).map_err(|e| e.to_string())?;
 
             // Get all files that are marked as trashed
-            let mut stmt = conn.prepare(
-                "SELECT id, filepath FROM media_files WHERE is_trashed = 1"
-            ).map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare("SELECT id, filepath FROM media_files WHERE is_trashed = 1")
+                .map_err(|e| e.to_string())?;
 
             let rows: Vec<(String, String)> = stmt
-                .query_map([], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
@@ -1897,17 +2610,31 @@ pub async fn empty_trash(handle: AppHandle) -> Result<i64, String> {
     .map_err(|e| format!("Task join error: {}", e))?
     .map_err(|e: String| e)?;
 
-    eprintln!("[empty_trash] Found {} trashed files to delete", files_to_delete.len());
+    eprintln!(
+        "[empty_trash] Found {} trashed files to delete",
+        files_to_delete.len()
+    );
 
     // Delete the physical files
-    for (_, filepath) in &files_to_delete {
-        if let Err(error) = validate_path_in_library(filepath, &library_root) {
-            eprintln!("[empty_trash] Skipping out-of-library file {}: {}", filepath, error);
-            continue;
-        }
-        eprintln!("[empty_trash] Deleting physical file: {}", filepath);
-        if let Err(e) = std::fs::remove_file(filepath) {
-            eprintln!("[empty_trash] Warning: Failed to delete physical file {}: {}", filepath, e);
+    if let Ok(conn) = open_conn(&db) {
+        for (media_id, filepath) in &files_to_delete {
+            if validate_path_in_library(filepath, &library_root).is_err() {
+                eprintln!("[empty_trash] Skipping out-of-library file {}", filepath);
+                continue;
+            }
+            media_bundle::purge_media_sidecar_and_library_attachment_files(
+                &conn,
+                media_id,
+                filepath,
+                &library_root,
+            );
+            eprintln!("[empty_trash] Deleting physical file: {}", filepath);
+            if let Err(e) = std::fs::remove_file(filepath) {
+                eprintln!(
+                    "[empty_trash] Warning: Failed to delete physical file {}: {}",
+                    filepath, e
+                );
+            }
         }
     }
 
@@ -1923,7 +2650,10 @@ pub async fn empty_trash(handle: AppHandle) -> Result<i64, String> {
     .map_err(|e| format!("Task join error: {}", e))?
     .map_err(|e: String| e)?;
 
-    eprintln!("[empty_trash] Successfully emptied trash. {} records deleted.", deleted_count);
+    eprintln!(
+        "[empty_trash] Successfully emptied trash. {} records deleted.",
+        deleted_count
+    );
     Ok(deleted_count)
 }
 
@@ -1937,22 +2667,11 @@ pub async fn init_library(handle: AppHandle, parent_path: String) -> Result<Stri
     println!("init_library called with path: {}", parent_path);
     eprintln!("[init_library] Parent path provided: {}", parent_path);
 
-    // æž„å»º NocturneGallery å®Œæ•´è·¯å¾„
-    let library_root = std::path::Path::new(&parent_path)
-        .to_path_buf();
-
-    let library_root_str = library_root
-        .to_string_lossy()
-        .to_string();
+    let library_root_str = ensure_switchable_library_root(&parent_path)?;
 
     eprintln!("[init_library] Library root will be: {}", library_root_str);
 
     // åˆ›å»ºç›®å½•ç»“æž„ï¼ˆå¦‚æžœå·²å­˜åœ¨åˆ™ç›´æŽ¥ä½¿ç“¨ï¼‰
-    watcher::init_library_structure(&library_root_str)?;
-
-    // æ‰§è¡Œæ–‡ä»¶å¤¹é‡å‘½åè¿ç§»ï¼ˆåª’ä½“åº“â†’çµæ„Ÿåº“ï¼Œé¡¹ç›®æ–‡ä»¶â†’ä½œå“é›†ï¼‰
-    watcher::migrate_folder_names(&library_root_str)?;
-
     // æ›´æ–°æ•°æ®åº“ä¸­çš„è·¯å¾„（启动期仅运行一次）
     if !folder_paths_updated_once().swap(true, Ordering::Relaxed) {
         let db_path = db_path(&handle)?;
@@ -1968,12 +2687,18 @@ pub async fn init_library(handle: AppHandle, parent_path: String) -> Result<Stri
     };
 
     let state = handle.state::<crate::AppState>();
-    state.startup_backfill_shutdown.store(true, Ordering::Relaxed);
+    state
+        .startup_backfill_shutdown
+        .store(true, Ordering::Relaxed);
 
     let config_path = handle
         .path()
         .app_data_dir()
-        .map(|p| p.join(".nocturne/config.json").to_string_lossy().to_string())
+        .map(|p| {
+            p.join(".nocturne/config.json")
+                .to_string_lossy()
+                .to_string()
+        })
         .map_err(|e| format!("Failed to get config path: {}", e))?;
 
     // ç¡®ä¿ AppData/.nocturne ç›®å½•å­˜åœ¨
@@ -1996,7 +2721,9 @@ pub async fn init_library(handle: AppHandle, parent_path: String) -> Result<Stri
         .to_string_lossy()
         .to_string();
 
-    let old_db_path = handle.path().app_data_dir()
+    let old_db_path = handle
+        .path()
+        .app_data_dir()
         .map(|p| p.join("nocturne.db"))
         .ok();
     if let Some(ref old_db) = old_db_path {
@@ -2009,11 +2736,74 @@ pub async fn init_library(handle: AppHandle, parent_path: String) -> Result<Stri
         }
     }
     if let Err(e) = crate::db::init_db(&new_db_path) {
-        eprintln!("[init_library] Warning: Failed to init DB at new path: {}", e);
+        eprintln!(
+            "[init_library] Warning: Failed to init DB at new path: {}",
+            e
+        );
     }
 
-    eprintln!("[init_library] Library initialized successfully at: {}", library_root_str);
+    eprintln!(
+        "[init_library] Library initialized successfully at: {}",
+        library_root_str
+    );
     Ok(library_root_str)
+}
+
+fn ensure_switchable_library_root(raw_path: &str) -> Result<String, String> {
+    let path = raw_path.trim();
+    if path.is_empty() {
+        return Err("路径为空".to_string());
+    }
+
+    if watcher::is_valid_library_root(path) {
+        return watcher::normalize_library_root_path(path);
+    }
+
+    let root_path = std::path::Path::new(path);
+    if !root_path.exists() {
+        std::fs::create_dir_all(root_path).map_err(|e| format!("无法创建目录 {}：{}", path, e))?;
+    } else if !root_path.is_dir() {
+        return Err(format!("所选路径不是文件夹：{}", path));
+    }
+
+    let library_root = watcher::normalize_library_root_path(path)?;
+    watcher::init_library_structure(&library_root)?;
+    watcher::migrate_folder_names(&library_root)?;
+    watcher::normalize_library_root_path(&library_root)
+}
+
+fn restart_library_watcher(handle: &AppHandle, root: &str) {
+    let Ok(db) = db_path(handle) else {
+        log::warn!("[set_library_root] Cannot restart watcher: db_path failed");
+        return;
+    };
+    let state = handle.state::<AppState>();
+    let mut guard = state.library_watcher.lock().unwrap_or_else(|e| {
+        log::warn!("[set_library_root] Watcher mutex poisoned: {}", e);
+        e.into_inner()
+    });
+    if let Some(old) = guard.take() {
+        old.stop();
+    }
+    match LibraryWatcher::new(root, &db, handle.clone()) {
+        Ok(watcher) => {
+            *guard = Some(watcher);
+            eprintln!("[set_library_root] File watcher restarted for: {}", root);
+        }
+        Err(e) => log::warn!("[set_library_root] Failed to restart watcher: {}", e),
+    }
+}
+
+/// 前端 UI 平台：macos | windows | linux（按当前 Tauri 二进制目标，不依赖 WebView UA）
+#[command]
+pub fn get_native_platform() -> String {
+    if cfg!(target_os = "macos") {
+        "macos".to_string()
+    } else if cfg!(target_os = "windows") {
+        "windows".to_string()
+    } else {
+        "linux".to_string()
+    }
 }
 
 /// èŽ·å–åº“æ ¹ç›®å½•è·¯å¾„
@@ -2022,27 +2812,39 @@ pub async fn get_library_root(handle: AppHandle) -> Result<Option<String>, Strin
     let config_path = handle
         .path()
         .app_data_dir()
-        .map(|p| p.join(".nocturne/config.json").to_string_lossy().to_string())
+        .map(|p| {
+            p.join(".nocturne/config.json")
+                .to_string_lossy()
+                .to_string()
+        })
         .map_err(|e| format!("Failed to get config path: {}", e))?;
 
     if let Ok(content) = std::fs::read_to_string(&config_path) {
         if let Ok(config) = serde_json::from_str::<watcher::LibraryConfig>(&content) {
             // éªŒè¯è·¯å¾„æ˜¯å¦æœ‰æ•ˆ
             if watcher::is_valid_library_root(&config.root_path) {
-                // æ‰§è¡Œæ–‡ä»¶å¤¹é‡å‘½åè¿ç§»ï¼ˆåª’ä½“åº“â†’çµæ„Ÿåº“ï¼Œé¡¹ç›®æ–‡ä»¶â†’ä½œå“é›†ï¼‰
-                if let Err(e) = watcher::migrate_folder_names(&config.root_path) {
-                    eprintln!("[get_library_root] Migration warning: {}", e);
-                }
+                let root_path = watcher::normalize_library_root_path(&config.root_path)?;
 
-                // æ›´æ–°æ•°æ®åº“ä¸­çš„è·¯å¾„（启动期仅一次）
-                if !folder_paths_updated_once().swap(true, Ordering::Relaxed) {
-                    let db_path = db_path(&handle)?;
-                    if let Err(e) = watcher::update_folder_paths_in_db(&db_path, &config.root_path) {
-                        eprintln!("[get_library_root] Path update warning: {}", e);
+                if root_path != config.root_path {
+                    let updated = watcher::LibraryConfig {
+                        root_path: root_path.clone(),
+                        version: config.version.clone(),
+                    };
+                    if let Ok(json) = serde_json::to_string_pretty(&updated) {
+                        let _ = std::fs::write(&config_path, json);
                     }
                 }
 
-                return Ok(Some(config.root_path));
+                if let Err(e) = watcher::migrate_folder_names(&root_path) {
+                    eprintln!("[get_library_root] Migration warning: {}", e);
+                }
+
+                let db_path = db_path(&handle)?;
+                if let Err(e) = watcher::update_folder_paths_in_db(&db_path, &root_path) {
+                    eprintln!("[get_library_root] Path update warning: {}", e);
+                }
+
+                return Ok(Some(root_path));
             }
         }
     }
@@ -2052,24 +2854,54 @@ pub async fn get_library_root(handle: AppHandle) -> Result<Option<String>, Strin
 
 /// è®¾ç½®åº“æ ¹ç›®å½•è·¯å¾„
 #[command]
-pub async fn set_library_root(handle: AppHandle, path: String) -> Result<(), String> {
-    eprintln!("[set_library_root] Setting library root to: {}", path);
+pub async fn set_library_root(handle: AppHandle, path: String) -> Result<String, String> {
+    eprintln!("[set_library_root] Requested path: {}", path);
 
-    // éªŒè¯è·¯å¾„æ˜¯å¦æœ‰æ•ˆ
-    if !watcher::is_valid_library_root(&path) {
-        return Err("Invalid library root: .nocturne directory not found".to_string());
+    let data_dir = handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let previous_root = watcher::configured_library_root_from_app_data(&data_dir);
+
+    let library_root = ensure_switchable_library_root(&path)?;
+    eprintln!("[set_library_root] Resolved library root: {}", library_root);
+
+    if let Some(ref old) = previous_root {
+        if crate::media::library_relocate::should_relocate_library_on_switch(old, &library_root) {
+            {
+                let state = handle.state::<AppState>();
+                let mut guard = state
+                    .library_watcher
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(w) = guard.take() {
+                    w.stop();
+                    eprintln!("[set_library_root] Stopped file watcher before library relocation");
+                }
+            }
+            crate::media::library_relocate::relocate_library_contents(old, &library_root)?;
+        }
     }
 
     let config = watcher::LibraryConfig {
-        root_path: path.clone(),
+        root_path: library_root.clone(),
         version: "1.0".to_string(),
     };
 
     let config_path = handle
         .path()
         .app_data_dir()
-        .map(|p| p.join(".nocturne/config.json").to_string_lossy().to_string())
+        .map(|p| {
+            p.join(".nocturne/config.json")
+                .to_string_lossy()
+                .to_string()
+        })
         .map_err(|e| format!("Failed to get config path: {}", e))?;
+
+    if let Some(parent) = std::path::Path::new(&config_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create config dir: {}", e))?;
+    }
 
     let config_json = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
@@ -2077,33 +2909,71 @@ pub async fn set_library_root(handle: AppHandle, path: String) -> Result<(), Str
     std::fs::write(&config_path, config_json)
         .map_err(|e| format!("Failed to write config: {}", e))?;
 
-    // Allow the new library root in the asset protocol scope so media files and
-    // thumbnails under it can be served via convertFileSrc immediately.
-    //
-    // We intentionally do NOT forbid the old library root here because:
-    //   1. The UI may still hold references to old-root thumbnails until the next
-    //      media list refresh; forbidding would cause transient broken previews.
-    //   2. tauri::scope::FsScope::forbid_directory has no guaranteed effect on
-    //      already-opened asset requests in flight.
-    //   3. The risk window is small: the old root remains readable only until the
-    //      next app restart, after which the scope is rebuilt from the new config.
-    // Residual documented in .audit/findings.md.
-    if let Err(e) = handle.asset_protocol_scope().allow_directory(
-        std::path::Path::new(&path),
-        true,
-    ) {
-        log::warn!("[set_library_root] Failed to allow library root in asset scope: {}", e);
+    let new_db_path = std::path::Path::new(&library_root)
+        .join(".nocturne")
+        .join("nocturne.db")
+        .to_string_lossy()
+        .to_string();
+
+    let data_dir = handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let old_appdata_db = data_dir.join("nocturne.db");
+    if old_appdata_db.exists() && !std::path::Path::new(&new_db_path).exists() {
+        if let Some(parent) = std::path::Path::new(&new_db_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        eprintln!(
+            "[set_library_root] Migrating AppData database to library: {}",
+            new_db_path
+        );
+        match std::fs::copy(&old_appdata_db, &new_db_path) {
+            Ok(_) => eprintln!("[set_library_root] Database migrated successfully"),
+            Err(e) => eprintln!("[set_library_root] Database migration failed: {}", e),
+        }
     }
 
-    Ok(())
+    if let Err(e) = crate::db::init_db(&new_db_path) {
+        eprintln!(
+            "[set_library_root] Warning: Failed to init DB at new path: {}",
+            e
+        );
+    }
+
+    if let Err(e) = watcher::migrate_folder_names(&library_root) {
+        eprintln!("[set_library_root] Folder name migration warning: {}", e);
+    }
+
+    if let Ok(db) = db_path(&handle) {
+        if let Err(e) = watcher::update_folder_paths_in_db(&db, &library_root) {
+            eprintln!("[set_library_root] DB path prefix update warning: {}", e);
+        }
+    }
+
+    if let Err(e) = handle
+        .asset_protocol_scope()
+        .allow_directory(std::path::Path::new(&library_root), true)
+    {
+        log::warn!(
+            "[set_library_root] Failed to allow library root in asset scope: {}",
+            e
+        );
+    }
+
+    restart_library_watcher(&handle, &library_root);
+
+    let _ = handle.emit(
+        "library_root_changed",
+        serde_json::json!({ "root": library_root }),
+    );
+
+    Ok(library_root)
 }
 
 ///èŽ·å–ç“¨æˆ·åå¥½è®¾ç½®
 #[command]
-pub async fn get_preference(
-    handle: AppHandle,
-    key: String,
-) -> Result<Option<String>, String> {
+pub async fn get_preference(handle: AppHandle, key: String) -> Result<Option<String>, String> {
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
@@ -2115,11 +2985,7 @@ pub async fn get_preference(
 
 /// è®¾ç½®ç“¨æˆ·åå¥½è®¾ç½®
 #[command]
-pub async fn set_preference(
-    handle: AppHandle,
-    key: String,
-    value: String,
-) -> Result<(), String> {
+pub async fn set_preference(handle: AppHandle, key: String, value: String) -> Result<(), String> {
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
@@ -2143,18 +3009,19 @@ fn query_ai_chat_sessions(conn: &rusqlite::Connection) -> Result<Vec<AiChatSessi
         )
         .map_err(|e| e.to_string())?;
 
-    let sessions = stmt.query_map([], |row| {
-        Ok(AiChatSession {
-            id: row.get(0)?,
-            title: row.get(1)?,
-            created_at: row.get(2)?,
-            updated_at: row.get(3)?,
-            message_count: row.get(4)?,
+    let sessions = stmt
+        .query_map([], |row| {
+            Ok(AiChatSession {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created_at: row.get(2)?,
+                updated_at: row.get(3)?,
+                message_count: row.get(4)?,
+            })
         })
-    })
-    .map_err(|e| e.to_string())?
-    .collect::<rusqlite::Result<Vec<_>>>()
-    .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
     Ok(sessions)
 }
 
@@ -2167,8 +3034,11 @@ fn load_ai_chat_result(
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty());
     let should_persist_active_session = requested_session_id.is_some();
-    let preferred_session_id = requested_session_id
-        .or_else(|| crud::get_preference(conn, ACTIVE_AI_CHAT_SESSION_PREF).ok().flatten());
+    let preferred_session_id = requested_session_id.or_else(|| {
+        crud::get_preference(conn, ACTIVE_AI_CHAT_SESSION_PREF)
+            .ok()
+            .flatten()
+    });
 
     let active_session_id = preferred_session_id
         .filter(|id| sessions.iter().any(|session| session.id == *id))
@@ -2189,7 +3059,8 @@ fn load_ai_chat_result(
                  ORDER BY created_at ASC, rowid ASC",
             )
             .map_err(|e| e.to_string())?;
-        let loaded_messages = stmt.query_map([session_id], |row| row.get::<_, String>(0))
+        let loaded_messages = stmt
+            .query_map([session_id], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?
             .filter_map(|payload| payload.ok())
             .filter_map(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
@@ -2342,32 +3213,35 @@ pub async fn delete_ai_chat_session(
 /// æ‰«æåº“æ ¹ç›®å½•ä¸‹çš„æ‰€æœ‰å­æ–‡ä»¶å¤¹
 #[command]
 pub async fn scan_library(handle: AppHandle) -> Result<ScanResult, String> {
+    sync_library_from_disk(handle).await
+}
+
+/// 增量同步：磁盘上有、数据库里没有的素材自动入库。
+#[command]
+pub async fn sync_library_from_disk(handle: AppHandle) -> Result<ScanResult, String> {
     let root = library_root(&handle)?;
     let db = db_path(&handle)?;
 
-    eprintln!("[scan_library] Scanning entire library root: {}", root);
+    eprintln!("[sync_library_from_disk] Syncing: {}", root);
 
-    // ç¼©ç•¥å›¾ç›®å½•ä½¿ç“¨åº“æ ¹ç›®å½•ä¸‹çš„ .nocturne/thumbsï¼Œä¸Ž scanner.rs ä¿æŒä¸€è‡´
-    let thumbs = std::path::Path::new(&root).join(".nocturne").join("thumbs").to_string_lossy().to_string();
-    eprintln!("[scan_library] Thumbs dir: {}", thumbs);
-
-    let h = handle.clone();
     let result = tokio::task::spawn_blocking(move || {
-        scanner::scan_directory_with_progress(&root, &db, &thumbs, |current, total, filename| {
-            let _ = h.emit("scan_progress", serde_json::json!({
-                "current": current,
-                "total": total,
-                "filename": filename,
-            }));
-        })
+        crate::media::library_sync::sync_library_from_disk(&root, &db)
     })
     .await
-    .map_err(|e| format!("Task join error: {}", e))?
-    .map_err(|e| format!("scan_library failed: {:?}", e))?;
+    .map_err(|e| format!("Task join error: {}", e))??;
 
-    eprintln!("[scan_library] Scan completed: scanned={}, imported={}, skipped={}",
-        result.scanned_count, result.imported_count, result.skipped_count);
-    let _ = handle.emit("scan_complete", serde_json::json!({ "total": result.imported_count }));
+    eprintln!(
+        "[sync_library_from_disk] scanned={}, imported={}, skipped={}",
+        result.scanned_count, result.imported_count, result.skipped_count
+    );
+    let _ = handle.emit(
+        "library_files_imported",
+        serde_json::json!({ "imported": result.imported_count }),
+    );
+    let _ = handle.emit(
+        "scan_complete",
+        serde_json::json!({ "total": result.imported_count }),
+    );
 
     Ok(result)
 }
@@ -2389,56 +3263,14 @@ pub async fn clear_all_media(handle: AppHandle) -> Result<i64, String> {
     Ok(count)
 }
 
-/// é‡æ–°æ‰«æåº“ç›®å½•ï¼ˆå…ˆæ¸…ç©ºå†æ‰«æï¼‰
+/// 重新扫描：增量同步磁盘上新文件（不清空数据库）。
 #[command]
 pub async fn rescan_library(handle: AppHandle) -> Result<ScanResult, String> {
-    eprintln!("[rescan_library] Starting rescan...");
-
-    // å…ˆæ¸…ç©ºæ‰€æœ‰æ•°æ®
-    let db = db_path(&handle)?;
-    let count = tokio::task::spawn_blocking(move || {
-        let mut conn = open_conn(&db).map_err(|e| e.to_string())?;
-        crud::clear_all_data(&mut conn).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
-    .map_err(|e| format!("clear_all_data error: {}", e))?;
-
-    eprintln!("[rescan_library] Data cleared ({} files), now scanning...", count);
-
-    // èŽ·å–åº“æ ¹ç›®å½•å¹¶æ‰«ææ•´ä¸ªç›®å½•
-    let root = library_root(&handle)?;
-    eprintln!("[rescan_library] Scanning entire library root: {}", root);
-
-    let db = db_path(&handle)?;
-
-    // ç¼©ç•¥å›¾ç›®å½•ä½¿ç“¨åº“æ ¹ç›®å½•ä¸‹çš„ .nocturne/thumbs
-    let thumbs = std::path::Path::new(&root).join(".nocturne").join("thumbs").to_string_lossy().to_string();
-    eprintln!("[rescan_library] Thumbs dir: {}", thumbs);
-
-    let h = handle.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        scanner::scan_directory_with_progress(&root, &db, &thumbs, |current, total, filename| {
-            let _ = h.emit("scan_progress", serde_json::json!({
-                "current": current,
-                "total": total,
-                "filename": filename,
-            }));
-        })
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
-    .map_err(|e| format!("scan_directory failed: {:?}", e))?;
-
-    eprintln!("[rescan_library] Scan completed: scanned={}, imported={}, skipped={}",
-        result.scanned_count, result.imported_count, result.skipped_count);
-    let _ = handle.emit("scan_complete", serde_json::json!({ "total": result.imported_count }));
-
-    Ok(result)
+    eprintln!("[rescan_library] Incremental sync from disk");
+    sync_library_from_disk(handle).await
 }
 
-/// å°†æ–‡ä»¶ç§»åŠ¨åˆ°ç›®æ ‡æ–‡ä»¶å¤¹ï¼ˆçµæ„Ÿåº“/é¡¹ç›®æ–‡ä»¶/å›žæ“¶ç«™ï¼‰
-/// åŒç›˜ç§»åŠ¨ç“¨ renameï¼Œè·¨ç›˜ä¼šå¤±è´¥
+/// 将文件移动到目标文件夹（灵感库/作品集/回收站）
 #[command]
 pub async fn move_file_to_folder(
     handle: AppHandle,
@@ -2446,7 +3278,15 @@ pub async fn move_file_to_folder(
     source_path: String,
     target_folder: String,
 ) -> Result<(), String> {
-    eprintln!("[move_file_to_folder] Moving file {} to folder {}", file_id, target_folder);
+    eprintln!(
+        "[move_file_to_folder] Moving file {} to folder {}",
+        file_id, target_folder
+    );
+
+    let target_folder_trimmed = target_folder.trim();
+    if target_folder_trimmed == TRASH_FOLDER_NAME {
+        return move_to_trash(handle, file_id).await;
+    }
 
     // èŽ·å–åº“æ ¹ç›®å½•
     let library_root = library_root(&handle)?;
@@ -2476,54 +3316,107 @@ pub async fn move_file_to_folder(
             source_path_from_db
         );
     }
-    let source_path = source_path_from_db;
+    let (db_filename, source_folder): (String, String) = tokio::task::spawn_blocking({
+        let db = db_for_lookup.clone();
+        let file_id = file_id.clone();
+        move || {
+            let conn = open_conn(&db).map_err(|e| e.to_string())?;
+            conn.query_row(
+                "SELECT filename, COALESCE(source_folder, '') FROM media_files WHERE id = ?",
+                rusqlite::params![file_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|e| format!("Media file not found: {}", e))
+        }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
+
+    let source_path_buf = resolve_library_media_on_disk(
+        &source_path_from_db,
+        &db_filename,
+        &source_folder,
+        &library_root,
+    )
+    .ok_or_else(|| {
+        format!(
+            "无法在磁盘上找到源文件（记录：{}），未移动",
+            source_path_from_db
+        )
+    })?;
+    if !is_movable_library_entry(&source_path_buf) {
+        return Err(format!(
+            "源文件不存在或无法访问：{}",
+            source_path_buf.display()
+        ));
+    }
+    let source_path = source_path_buf.to_string_lossy().to_string();
     validate_path_in_library(&source_path, &library_root)?;
     let target_folder = validate_library_relative_folder(&target_folder)?;
 
     // æž„å»ºç›®æ ‡è·¯å¾„ï¼šlibrary_root + target_folder + filename
-    let filename = std::path::Path::new(&source_path)
+    let filename = source_path_buf
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or("Invalid source path")?
+        .unwrap_or(db_filename.as_str())
         .to_string();
 
-    let target_path = std::path::Path::new(&library_root)
-        .join(&target_folder)
-        .join(&filename);
+    let target_dir = std::path::Path::new(&library_root).join(&target_folder);
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| format!("Failed to create target folder: {}", e))?;
+    let target_path = unique_path_in_dir(&target_dir, &filename);
 
     let target_path_str = target_path.to_string_lossy().to_string();
     validate_path_in_library(&target_path_str, &library_root)?;
     eprintln!("[move_file_to_folder] Target path: {}", target_path_str);
 
-    // ç¡®ä¿ç›®æ ‡æ–‡ä»¶å¤¹å­˜åœ¨
-    let _ = handle.emit("file_move_progress", serde_json::json!({
-        "current": 0,
-        "total": 1,
-        "filename": filename,
-    }));
-    std::fs::create_dir_all(std::path::Path::new(&library_root).join(&target_folder))
-        .map_err(|e| format!("Failed to create target folder: {}", e))?;
+    let _ = handle.emit(
+        "file_move_progress",
+        serde_json::json!({
+            "current": 0,
+            "total": 1,
+            "filename": filename,
+        }),
+    );
 
-    // åŒç›˜ç§»åŠ¨æ–‡ä»¶ï¼ˆrenameï¼‰
+    let new_filename = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&filename)
+        .to_string();
+    let source_path_move = source_path.clone();
+    let library_root_move = library_root.clone();
+    let file_id_move = file_id.clone();
+    let target_path_str_move = target_path_str.clone();
+    let filename_move = filename.clone();
+    let db_move = db_path(&handle)?;
+
+    let target_path_for_verify = target_path.clone();
     tokio::task::spawn_blocking(move || {
-        std::fs::rename(&source_path, &target_path)
-            .map_err(|e| format!("Failed to move file: {}", e))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
-    .map_err(|e| {
-        eprintln!("[move_file_to_folder] Move failed: {}", e);
-        e
-    })?;
-
-    eprintln!("[move_file_to_folder] File moved successfully");
-
-    // æ›´æ–°æ•°æ®åº“ä¸­çš„è·¯å¾„
-    let db = db_path(&handle)?;
-    tokio::task::spawn_blocking(move || {
-        let mut conn = open_conn(&db).map_err(|e| e.to_string())?;
-        crud::update_media_file_path(&mut conn, &file_id, &target_path_str)
-            .map_err(|e| e.to_string())
+        move_file_within_library(std::path::Path::new(&source_path_move), &target_path)?;
+        if !target_path_for_verify.is_file() {
+            return Err(format!(
+                "文件移动后未出现在目标目录：{}",
+                target_path_str_move
+            ));
+        }
+        let mut conn = open_conn(&db_move).map_err(|e| e.to_string())?;
+        relocate_bundle_after_move(
+            &conn,
+            &file_id_move,
+            &source_path_move,
+            &target_path_str_move,
+            &filename_move,
+            &new_filename,
+            &library_root_move,
+        );
+        crud::update_media_file_path(
+            &mut conn,
+            &file_id_move,
+            &target_path_str_move,
+            Some(library_root_move.as_str()),
+        )
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -2555,8 +3448,14 @@ pub async fn add_bookmark(
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
-        crud::insert_bookmark(&conn, &url, title.as_deref(), description.as_deref(), tags.as_deref())
-            .map_err(|e| e.to_string())
+        crud::insert_bookmark(
+            &conn,
+            &url,
+            title.as_deref(),
+            description.as_deref(),
+            tags.as_deref(),
+        )
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -2598,8 +3497,14 @@ pub async fn update_bookmark(
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
-        crud::update_bookmark(&conn, id, title.as_deref(), description.as_deref(), tags.as_deref())
-            .map_err(|e| e.to_string())
+        crud::update_bookmark(
+            &conn,
+            id,
+            title.as_deref(),
+            description.as_deref(),
+            tags.as_deref(),
+        )
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -2610,11 +3515,9 @@ pub async fn update_bookmark(
 pub async fn open_url_in_browser(url: String) -> Result<(), String> {
     let url = validate_http_url(&url)?;
     eprintln!("[open_url_in_browser] Opening: {}", url);
-    tokio::task::spawn_blocking(move || {
-        open::that(&url).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
+    tokio::task::spawn_blocking(move || open::that(&url).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
 }
 
 /// ä»Žå¤–éƒ¨æ‹–å…¥æ–‡ä»¶åˆ°åº“ç›®å½•ï¼ˆå¤åˆ¶æ–‡ä»¶å¹¶å¯¼å…¥æ•°æ®åº“ï¼‰
@@ -2625,7 +3528,11 @@ pub async fn import_file_to_library(
     target_folder: String,
     target_category: Option<String>,
 ) -> Result<(), String> {
-    log::debug!("[import_file_to_library] Importing {} to {}", source_path, target_folder);
+    log::debug!(
+        "[import_file_to_library] Importing {} to {}",
+        source_path,
+        target_folder
+    );
 
     // èŽ·å–åº“æ ¹ç›®å½•
     let library_root = library_root(&handle)?;
@@ -2648,20 +3555,66 @@ pub async fn import_file_to_library(
 
     // æ£€æŸ¥ç›®æ ‡æ–‡ä»¶æ˜¯å¦å·²å­˜åœ¨ï¼ˆå­˜åœ¨åˆ™è·³è¿‡ï¼‰
     if target_path.exists() {
-        log::debug!("[import_file_to_library] File already exists, skipping: {}", target_path_str);
-        let _ = handle.emit("import_skipped", serde_json::json!({
-            "filename": filename,
-            "targetFolder": target_folder,
-            "reason": "existing-file",
-        }));
+        log::debug!(
+            "[import_file_to_library] File already exists, backfilling thumbnails: {}",
+            target_path_str
+        );
+        let db_existing = db_path(&handle)?;
+        if let Ok(conn) = open_conn(&db_existing) {
+            if let Ok(existing_id) = media_id_by_filepath(&conn, &target_path_str) {
+                let ext_lower = target_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_lowercase())
+                    .unwrap_or_default();
+                let is_heavy = matches!(
+                    ext_lower.as_str(),
+                    "psd" | "psb" | "tiff" | "mp4" | "mov" | "avi" | "mkv" | "webm"
+                );
+                let sem = if is_heavy {
+                    scanner::HEAVY_ENRICH_SEMAPHORE.clone()
+                } else {
+                    scanner::LIGHT_ENRICH_SEMAPHORE.clone()
+                };
+                let id_bf = existing_id.clone();
+                let id_emit = existing_id.clone();
+                let path_bf = target_path_str.clone();
+                let db_bf = db_existing.clone();
+                let root_bf = library_root.clone();
+                let handle_bf = handle.clone();
+                tokio::spawn(async move {
+                    if let Ok(_permit) = sem.acquire_owned().await {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            scanner::scan_single_file_enrich(&id_bf, &path_bf, &db_bf, &root_bf)
+                        })
+                        .await;
+                    }
+                    let _ = handle_bf.emit(
+                        "media_metadata_updated",
+                        serde_json::json!({ "id": id_emit }),
+                    );
+                });
+            }
+        }
+        let _ = handle.emit(
+            "import_skipped",
+            serde_json::json!({
+                "filename": filename,
+                "targetFolder": target_folder,
+                "reason": "existing-file",
+            }),
+        );
         return Ok(());
     }
 
-    let _ = handle.emit("import_progress", serde_json::json!({
-        "current": 0,
-        "total": 1,
-        "filename": filename.clone(),
-    }));
+    let _ = handle.emit(
+        "import_progress",
+        serde_json::json!({
+            "current": 0,
+            "total": 1,
+            "filename": filename.clone(),
+        }),
+    );
 
     // ── Phase 1：最小化扫描（从源文件读元数据，但记录库内目标路径），< 10ms ──
     let db = db_path(&handle)?;
@@ -2684,16 +3637,20 @@ pub async fn import_file_to_library(
     };
 
     // 类别分配紧跟 Phase 1
-    assign_category_for_filepath(&db, &target_path_str, target_category.as_deref())
-        .map_err(|e| {
+    assign_category_for_filepath(&db, &target_path_str, target_category.as_deref()).map_err(
+        |e| {
             log::debug!("[import_file_to_library] Category assignment failed: {}", e);
             e
-        })?;
+        },
+    )?;
 
-    let _ = handle.emit("import_index_committed", serde_json::json!({
-        "current": 1,
-        "total": 1,
-    }));
+    let _ = handle.emit(
+        "import_index_committed",
+        serde_json::json!({
+            "current": 1,
+            "total": 1,
+        }),
+    );
 
     // ── Phase 2：物理复制成功后再完成导入提示 ──
     let db_p2 = db.clone();
@@ -2708,7 +3665,10 @@ pub async fn import_file_to_library(
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
 
-    let is_heavy = matches!(ext_lower.as_str(), "psd" | "psb" | "tiff" | "mp4" | "mov" | "avi" | "mkv" | "webm");
+    let is_heavy = matches!(
+        ext_lower.as_str(),
+        "psd" | "psb" | "tiff" | "mp4" | "mov" | "avi" | "mkv" | "webm"
+    );
     let semaphore = if is_heavy {
         std::sync::Arc::clone(&scanner::HEAVY_ENRICH_SEMAPHORE)
     } else {
@@ -2727,13 +3687,14 @@ pub async fn import_file_to_library(
     let target_path_buf_for_copy = target_path.clone();
     let target_p2_for_copy = target_p2.clone();
     let copy_result = tokio::task::spawn_blocking(move || {
-            // 确保目录存在
-            if let Some(parent) = target_path_buf_for_copy.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            std::fs::copy(&source_p2, &target_p2_for_copy)
-                .map_err(|e| format!("Background copy failed: {}", e))
-    }).await;
+        // 确保目录存在
+        if let Some(parent) = target_path_buf_for_copy.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::copy(&source_p2, &target_p2_for_copy)
+            .map_err(|e| format!("Background copy failed: {}", e))
+    })
+    .await;
     drop(copy_permit);
 
     match copy_result {
@@ -2750,6 +3711,10 @@ pub async fn import_file_to_library(
         }
     }
 
+    if let Ok(conn) = open_conn(&db) {
+        let _ = scanner::ensure_image_micro_thumbnail_for_file(&conn, &file_id, &target_path_str);
+    }
+
     if let Ok(_permit) = semaphore.acquire_owned().await {
         let id_for_enrich = file_id.clone();
         let target_p2_for_enrich = target_p2.clone();
@@ -2757,27 +3722,51 @@ pub async fn import_file_to_library(
         let root_p2_for_enrich = root_p2.clone();
 
         match tokio::task::spawn_blocking(move || {
-            scanner::scan_single_file_enrich(&id_for_enrich, &target_p2_for_enrich, &db_p2_for_enrich, &root_p2_for_enrich)
-        }).await {
+            scanner::scan_single_file_enrich(
+                &id_for_enrich,
+                &target_p2_for_enrich,
+                &db_p2_for_enrich,
+                &root_p2_for_enrich,
+            )
+        })
+        .await
+        {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => log::warn!("[import_file_to_library] Enrich failed for {}: {}", target_p2, e),
-            Err(e) => log::warn!("[import_file_to_library] Enrich task join error for {}: {}", target_p2, e),
+            Ok(Err(e)) => log::warn!(
+                "[import_file_to_library] Enrich failed for {}: {}",
+                target_p2,
+                e
+            ),
+            Err(e) => log::warn!(
+                "[import_file_to_library] Enrich task join error for {}: {}",
+                target_p2,
+                e
+            ),
         }
     } else {
-        log::warn!("[import_file_to_library] Failed to acquire enrich permit for {}", target_p2);
+        log::warn!(
+            "[import_file_to_library] Failed to acquire enrich permit for {}",
+            target_p2
+        );
     }
 
-    let _ = handle.emit("media_metadata_updated", serde_json::json!({ "id": file_id }));
-    let _ = handle.emit("import_progress", serde_json::json!({
-        "current": 1,
-        "total": 1,
-        "filename": filename.clone(),
-    }));
+    let _ = handle.emit(
+        "media_metadata_updated",
+        serde_json::json!({ "id": file_id }),
+    );
+    let _ = handle.emit(
+        "import_progress",
+        serde_json::json!({
+            "current": 1,
+            "total": 1,
+            "filename": filename.clone(),
+        }),
+    );
     let _ = handle.emit("import_complete", serde_json::json!({ "total": 1 }));
 
     log::debug!("[import_file_to_library] Import copy complete, enrichment attempted");
     Ok(())
-    }
+}
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //  å³é“®èœå• Commands
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2806,11 +3795,14 @@ pub async fn import_paths_to_library(
             });
         }
 
-        let _ = handle_for_task.emit("import_progress", serde_json::json!({
-            "current": 0,
-            "total": 1,
-            "filename": "正在分析拖入项目",
-        }));
+        let _ = handle_for_task.emit(
+            "import_progress",
+            serde_json::json!({
+                "current": 0,
+                "total": 1,
+                "filename": "正在分析拖入项目",
+            }),
+        );
 
         let library_root = library_root(&handle_for_task)?;
         let db = db_path(&handle_for_task)?;
@@ -2827,7 +3819,10 @@ pub async fn import_paths_to_library(
         for raw_source_path in source_paths {
             let source_path = std::path::PathBuf::from(&raw_source_path);
             if !source_path.exists() {
-                log::warn!("[import_paths_to_library] Source path does not exist: {}", raw_source_path);
+                log::warn!(
+                    "[import_paths_to_library] Source path does not exist: {}",
+                    raw_source_path
+                );
                 failed_count += 1;
                 continue;
             }
@@ -2863,7 +3858,10 @@ pub async fn import_paths_to_library(
                 .map(std::ffi::OsStr::to_os_string)
                 .unwrap_or_else(|| std::ffi::OsString::from("导入目录"));
 
-            for entry in walkdir::WalkDir::new(&source_path).into_iter().filter_map(Result::ok) {
+            for entry in walkdir::WalkDir::new(&source_path)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
                 let entry_path = entry.path();
                 if !entry_path.is_file() || !is_supported_import_file(entry_path) {
                     continue;
@@ -2903,11 +3901,14 @@ pub async fn import_paths_to_library(
         }
 
         // ── Phase 1：最小化扫描（批量写 DB），极快（事务优化） ──
-        let _ = handle_for_task.emit("import_progress", serde_json::json!({
-            "current": 0,
-            "total": total,
-            "filename": "正在写入素材索引",
-        }));
+        let _ = handle_for_task.emit(
+            "import_progress",
+            serde_json::json!({
+                "current": 0,
+                "total": total,
+                "filename": "正在写入素材索引",
+            }),
+        );
 
         let mut import_jobs: Vec<(String, std::path::PathBuf, std::path::PathBuf)> = Vec::new();
 
@@ -2923,38 +3924,67 @@ pub async fn import_paths_to_library(
                     let source_path_str = source_path.to_string_lossy();
                     let target_path_str = target_path.to_string_lossy();
 
-                    match scanner::scan_single_file_minimal_with_conn(&tx, &source_path_str, &target_path_str, &library_root) {
+                    // 批量导入不在索引阶段生成 micro（避免对源图 image::open N 次阻塞 UI）
+                    match scanner::scan_single_file_minimal_with_conn(
+                        &tx,
+                        &source_path_str,
+                        &target_path_str,
+                        &library_root,
+                        false,
+                    ) {
                         Ok(_) => {
                             let file_id = match media_id_by_filepath(&tx, &target_path_str) {
                                 Ok(id) => id,
                                 Err(e) => {
-                                    log::error!("[bulk import] media id lookup failed for {}: {}", target_path_str, e);
+                                    log::error!(
+                                        "[bulk import] media id lookup failed for {}: {}",
+                                        target_path_str,
+                                        e
+                                    );
                                     failed_count += 1;
                                     continue;
                                 }
                             };
 
                             indexed_count += 1;
-                            let _ = tx.execute(
-                                "UPDATE media_files SET source_folder = ? WHERE id = ?",
-                                rusqlite::params![target_category.as_deref(), file_id],
-                            );
+                            if let Some(category_name) = target_category.as_deref() {
+                                if let Err(e) =
+                                    crud::set_media_category(&tx, &file_id, category_name)
+                                {
+                                    log::warn!(
+                                        "[bulk import] category assignment failed for {}: {}",
+                                        target_path_str,
+                                        e
+                                    );
+                                }
+                            }
                             import_jobs.push((file_id, source_path.clone(), target_path.clone()));
                         }
                         Err(e) => {
-                            log::error!("[bulk import] minimal scan failed for {}: {}", target_path_str, e);
+                            log::error!(
+                                "[bulk import] minimal scan failed for {}: {}",
+                                target_path_str,
+                                e
+                            );
                             failed_count += 1;
                         }
                     }
                 }
 
-                tx.commit().map_err(|e| format!("Transaction commit failed: {}", e))?;
-                let _ = handle_for_task.emit("import_index_committed", serde_json::json!({
-                    "current": indexed_count,
-                    "total": total,
-                }));
+                tx.commit()
+                    .map_err(|e| format!("Transaction commit failed: {}", e))?;
+                let _ = handle_for_task.emit(
+                    "import_index_committed",
+                    serde_json::json!({
+                        "current": indexed_count,
+                        "total": total,
+                    }),
+                );
             }
         }
+
+        let mut enrich_jobs: Vec<(String, String)> = Vec::new();
+        const IMPORT_PROGRESS_EMIT_INTERVAL: i64 = 8;
 
         for (file_id, source_path, target_path) in import_jobs {
             let target_path_str = target_path.to_string_lossy().to_string();
@@ -2981,35 +4011,66 @@ pub async fn import_paths_to_library(
                 continue;
             }
 
-            if let Err(e) = scanner::scan_single_file_enrich(&file_id, &target_path_str, &db, &library_root) {
-                log::warn!("[bulk import] Enrich failed for {}: {}", target_path_str, e);
-            }
+            // micro / 主缩略图由后台 enrich 统一生成，避免复制阶段逐张解码阻塞前端
 
             imported_count += 1;
-            let _ = handle_for_task.emit("media_metadata_updated", serde_json::json!({ "id": file_id }));
-            let _ = handle_for_task.emit("import_progress", serde_json::json!({
-                "current": imported_count,
-                "total": total,
-                "filename": progress_filename,
-            }));
+            enrich_jobs.push((file_id.clone(), target_path_str.clone()));
+            if imported_count == total || imported_count % IMPORT_PROGRESS_EMIT_INTERVAL == 0 {
+                let _ = handle_for_task.emit(
+                    "import_progress",
+                    serde_json::json!({
+                        "current": imported_count,
+                        "total": total,
+                        "filename": progress_filename,
+                    }),
+                );
+            }
         }
 
-        let _ = handle_for_task.emit("import_complete", serde_json::json!({ "total": imported_count }));
+        let _ = handle_for_task.emit(
+            "import_complete",
+            serde_json::json!({ "total": imported_count }),
+        );
+
+        if !enrich_jobs.is_empty() {
+            let db_for_enrich = db.clone();
+            let root_for_enrich = library_root.clone();
+            let handle_for_enrich = handle_for_task.clone();
+            let enrich_ids: Vec<String> = enrich_jobs.iter().map(|(id, _)| id.clone()).collect();
+            std::thread::spawn(move || {
+                use rayon::prelude::*;
+                enrich_jobs.par_iter().for_each(|(file_id, target_path)| {
+                    if let Err(e) = scanner::scan_single_file_enrich(
+                        file_id,
+                        target_path,
+                        &db_for_enrich,
+                        &root_for_enrich,
+                    ) {
+                        log::warn!("[bulk import] Enrich failed for {}: {}", target_path, e);
+                    }
+                });
+                // 批量通知前端刷新，避免每张图触发 refreshFileById 压垮 UI
+                const BATCH_CHUNK: usize = 40;
+                for chunk in enrich_ids.chunks(BATCH_CHUNK) {
+                    let _ = handle_for_enrich.emit(
+                        "media_metadata_updated_batch",
+                        serde_json::json!({ "ids": chunk }),
+                    );
+                }
+            });
+        }
 
         Ok(ImportPathsResult {
             imported_count,
             skipped_count,
             failed_count,
         })
-        })
-        .await
-        .map_err(|e| format!("Task join error: {}", e))?
-        }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
+}
 #[command]
-pub async fn delete_file_permanently(
-    handle: AppHandle,
-    id: String,
-) -> Result<(), String> {
+pub async fn delete_file_permanently(handle: AppHandle, id: String) -> Result<(), String> {
     eprintln!("[delete_file_permanently] Deleting file: {}", id);
 
     let db = db_path(&handle)?;
@@ -3030,12 +4091,21 @@ pub async fn delete_file_permanently(
         // è·¯å¾„éªŒè¯ï¼šç¡®ä¿æ–‡ä»¶åœ¨åº“æ ¹ç›®å½•èŒƒå›´å†…
         validate_path_in_library(&filepath, &library_root)?;
 
-        eprintln!("[delete_file_permanently] Removing physical file: {}", filepath);
+        eprintln!(
+            "[delete_file_permanently] Removing physical file: {}",
+            filepath
+        );
 
         // åˆ é™¤ç‰©ç†æ–‡ä»¶
+        media_bundle::purge_media_sidecar_and_library_attachment_files(
+            &conn,
+            &id,
+            &filepath,
+            &library_root,
+        );
+
         // 删除物理文件
-        std::fs::remove_file(&filepath)
-            .map_err(|e| format!("Failed to delete file: {}", e))?;
+        std::fs::remove_file(&filepath).map_err(|e| format!("Failed to delete file: {}", e))?;
 
         eprintln!("[delete_file_permanently] Deleting database record: {}", id);
 
@@ -3060,7 +4130,11 @@ pub async fn batch_delete_files_permanently(
     ids: Vec<String>,
 ) -> Result<BatchFileOperationResult, String> {
     if ids.is_empty() {
-        return Ok(BatchFileOperationResult { succeeded: 0, failed: 0 });
+        return Ok(BatchFileOperationResult {
+            succeeded: 0,
+            failed: 0,
+            first_error: None,
+        });
     }
 
     let db = db_path(&handle)?;
@@ -3098,6 +4172,13 @@ pub async fn batch_delete_files_permanently(
                 continue;
             }
 
+            media_bundle::purge_media_sidecar_and_library_attachment_files(
+                &conn,
+                id,
+                filepath,
+                &library_root,
+            );
+
             match std::fs::remove_file(filepath) {
                 Ok(_) => deleted_ids.push(id.clone()),
                 Err(error) => {
@@ -3123,6 +4204,7 @@ pub async fn batch_delete_files_permanently(
         Ok(BatchFileOperationResult {
             succeeded: deleted_ids.len(),
             failed,
+            first_error: None,
         })
     })
     .await
@@ -3131,10 +4213,7 @@ pub async fn batch_delete_files_permanently(
 
 /// å¦å­˜ä¸º - æ‰“å¼€ç³»ç»Ÿä¿å­˜å¯¹è¯æ¡†å¹¶å¤åˆ¶æ–‡ä»¶
 #[command]
-pub async fn save_file_as(
-    handle: AppHandle,
-    source_path: String,
-) -> Result<String, String> {
+pub async fn save_file_as(handle: AppHandle, source_path: String) -> Result<String, String> {
     eprintln!("[save_file_as] Saving file: {}", source_path);
 
     // èŽ·å–é»˜è®¤æ–‡ä»¶å
@@ -3154,7 +4233,9 @@ pub async fn save_file_as(
 
         handle
             .run_on_main_thread(move || {
-                let file_path = handle_clone.dialog().file()
+                let file_path = handle_clone
+                    .dialog()
+                    .file()
                     .set_title("另存为")
                     .set_file_name(&default_name)
                     .blocking_save_file();
@@ -3163,12 +4244,10 @@ pub async fn save_file_as(
                     Some(path) => {
                         // ä½¿ç“¨ into_path() æ–¹æ³•è½¬æ¢ FilePath ä¸º PathBuf
                         match path.into_path() {
-                            Ok(path_buf) => {
-                                match std::fs::copy(&source_path_clone, &path_buf) {
-                                    Ok(_) => Ok(path_buf.to_string_lossy().to_string()),
-                                    Err(e) => Err(format!("Failed to copy file: {}", e)),
-                                }
-                            }
+                            Ok(path_buf) => match std::fs::copy(&source_path_clone, &path_buf) {
+                                Ok(_) => Ok(path_buf.to_string_lossy().to_string()),
+                                Err(e) => Err(format!("Failed to copy file: {}", e)),
+                            },
                             Err(e) => Err(format!("Failed to convert path: {}", e)),
                         }
                     }
@@ -3179,7 +4258,8 @@ pub async fn save_file_as(
             })
             .map_err(|e| format!("Failed to run on main thread: {}", e))?;
 
-        rx.recv().unwrap_or_else(|e| Err(format!("Channel error: {}", e)))
+        rx.recv()
+            .unwrap_or_else(|e| Err(format!("Channel error: {}", e)))
     })
     .await
     .map_err(|e| format!("Task error: {}", e))?
@@ -3193,7 +4273,7 @@ pub async fn write_temp_file(base64_data: String) -> Result<String, String> {
     // Determine file extension from original data URL if available
     let extension = if base64_data.starts_with("data:image/") {
         let mime_part = &base64_data[..base64_data.find(';').unwrap_or(base64_data.len())];
-        match mime_part.split('/').last() {
+        match mime_part.split('/').next_back() {
             Some("jpeg") | Some("jpg") => ".jpg",
             Some("png") => ".png",
             Some("gif") => ".gif",
@@ -3218,7 +4298,8 @@ pub async fn write_temp_file(base64_data: String) -> Result<String, String> {
 
     // Create a temporary file with unique name
     let temp_dir = std::env::temp_dir();
-    let unique_filename = format!("nocturne_paste_{}_{}",
+    let unique_filename = format!(
+        "nocturne_paste_{}_{}",
         chrono::Utc::now().timestamp_millis(),
         extension
     );
@@ -3231,7 +4312,10 @@ pub async fn write_temp_file(base64_data: String) -> Result<String, String> {
     std::fs::write(&temp_path, decoded_bytes)
         .map_err(|e| format!("Failed to write temp file: {}", e))?;
 
-    eprintln!("[write_temp_file] Temp file created successfully: {}", temp_path_str);
+    eprintln!(
+        "[write_temp_file] Temp file created successfully: {}",
+        temp_path_str
+    );
     Ok(temp_path_str)
 }
 
@@ -3271,7 +4355,10 @@ pub async fn import_generated_image_to_ai_prompts(
         let mut target_path = target_root.join(format!("ai-generated-{}.{}", timestamp, extension));
         let mut suffix = 1;
         while target_path.exists() {
-            target_path = target_root.join(format!("ai-generated-{}-{}.{}", timestamp, suffix, extension));
+            target_path = target_root.join(format!(
+                "ai-generated-{}-{}.{}",
+                timestamp, suffix, extension
+            ));
             suffix += 1;
         }
 
@@ -3282,11 +4369,14 @@ pub async fn import_generated_image_to_ai_prompts(
             .unwrap_or("ai-generated.png")
             .to_string();
 
-        let _ = handle_for_task.emit("import_progress", serde_json::json!({
-            "current": 0,
-            "total": 1,
-            "filename": filename,
-        }));
+        let _ = handle_for_task.emit(
+            "import_progress",
+            serde_json::json!({
+                "current": 0,
+                "total": 1,
+                "filename": filename,
+            }),
+        );
 
         std::fs::copy(&source_path_buf, &target_path)
             .map_err(|e| format!("Failed to save generated image: {}", e))?;
@@ -3305,13 +4395,19 @@ pub async fn import_generated_image_to_ai_prompts(
         )
         .map_err(|e| e.to_string())?;
 
-        let _ = handle_for_task.emit("import_progress", serde_json::json!({
-            "current": 1,
-            "total": 1,
-            "filename": media_file.filename,
-        }));
+        let _ = handle_for_task.emit(
+            "import_progress",
+            serde_json::json!({
+                "current": 1,
+                "total": 1,
+                "filename": media_file.filename,
+            }),
+        );
         let _ = handle_for_task.emit("import_complete", serde_json::json!({ "total": 1 }));
-        let _ = handle_for_task.emit("media_metadata_updated", serde_json::json!({ "id": media_file.id }));
+        let _ = handle_for_task.emit(
+            "media_metadata_updated",
+            serde_json::json!({ "id": media_file.id }),
+        );
 
         Ok(media_file)
     })
@@ -3325,7 +4421,10 @@ pub async fn extract_colors(
     media_id: String,
     file_path: String,
 ) -> Result<Vec<String>, String> {
-    eprintln!("[extract_colors] Extracting colors from: {} for media_id: {}", file_path, media_id);
+    eprintln!(
+        "[extract_colors] Extracting colors from: {} for media_id: {}",
+        file_path, media_id
+    );
 
     // é¦–å…ˆæ£€æŸ¥æ•°æ®åº“ä¸­æ˜¯å¦å·²æœ‰ç¼“å­˜
     let db = db_path(&handle)?;
@@ -3363,15 +4462,20 @@ pub async fn extract_colors(
 
     // 没有缓存，从图片提取（复用公共函数）
     let file_path_clone = file_path.clone();
-    let top_colors: Vec<String> = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
-        let img = image::open(&file_path_clone)
-            .map_err(|e| format!("Failed to open image: {}", e))?;
-        Ok(crate::media::thumbnail::extract_dominant_colors(&img))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))??;
+    let top_colors: Vec<String> =
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+            let img = image::open(&file_path_clone)
+                .map_err(|e| format!("Failed to open image: {}", e))?;
+            Ok(crate::media::thumbnail::extract_dominant_colors(&img))
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))??;
 
-    eprintln!("[extract_colors] Extracted {} colors: {:?}", top_colors.len(), top_colors);
+    eprintln!(
+        "[extract_colors] Extracted {} colors: {:?}",
+        top_colors.len(),
+        top_colors
+    );
 
     // ç¼“å­˜åˆ°æ•°æ®åº“
     let colors_json = serde_json::to_string(&top_colors)
@@ -3388,7 +4492,10 @@ pub async fn extract_colors(
                 rusqlite::params![colors_json, media_id],
             )
             .map_err(|e| e.to_string())?;
-            eprintln!("[extract_colors] Cached colors to database for media_id: {}", media_id);
+            eprintln!(
+                "[extract_colors] Cached colors to database for media_id: {}",
+                media_id
+            );
             Ok(())
         }
     })
@@ -3407,7 +4514,10 @@ pub async fn save_clipboard_image(
     target_folder: Option<String>,
     target_category: Option<String>,
 ) -> Result<String, String> {
-    eprintln!("[save_clipboard_image] Saving clipboard image: {}", file_name);
+    eprintln!(
+        "[save_clipboard_image] Saving clipboard image: {}",
+        file_name
+    );
 
     // Get library root directory using the existing function
     let library_root = library_root(&handle)?;
@@ -3423,11 +4533,14 @@ pub async fn save_clipboard_image(
     eprintln!("[save_clipboard_image] Target path: {}", target_path_str);
 
     // Ensure target folder exists
-    let _ = handle.emit("import_progress", serde_json::json!({
-        "current": 0,
-        "total": 1,
-        "filename": file_name.clone(),
-    }));
+    let _ = handle.emit(
+        "import_progress",
+        serde_json::json!({
+            "current": 0,
+            "total": 1,
+            "filename": file_name.clone(),
+        }),
+    );
     std::fs::create_dir_all(std::path::Path::new(&library_root).join(&target_folder))
         .map_err(|e| format!("Failed to create target folder: {}", e))?;
 
@@ -3435,7 +4548,10 @@ pub async fn save_clipboard_image(
     std::fs::write(&target_path, image_bytes)
         .map_err(|e| format!("Failed to write image file: {}", e))?;
 
-    eprintln!("[save_clipboard_image] Image saved successfully: {}", target_path_str);
+    eprintln!(
+        "[save_clipboard_image] Image saved successfully: {}",
+        target_path_str
+    );
 
     // Scan the imported file into the database
     let db = db_path(&handle)?;
@@ -3462,18 +4578,25 @@ pub async fn save_clipboard_image(
         e
     })?;
 
-    assign_category_for_filepath(&db, &target_path_str, target_category.as_deref())
-        .map_err(|e| {
+    assign_category_for_filepath(&db, &target_path_str, target_category.as_deref()).map_err(
+        |e| {
             eprintln!("[save_clipboard_image] Category assignment failed: {}", e);
             e
-        })?;
+        },
+    )?;
 
-    eprintln!("[save_clipboard_image] File saved and scanned successfully: {}", target_path_str);
-    let _ = handle.emit("import_progress", serde_json::json!({
-        "current": 1,
-        "total": 1,
-        "filename": file_name,
-    }));
+    eprintln!(
+        "[save_clipboard_image] File saved and scanned successfully: {}",
+        target_path_str
+    );
+    let _ = handle.emit(
+        "import_progress",
+        serde_json::json!({
+            "current": 1,
+            "total": 1,
+            "filename": file_name,
+        }),
+    );
     let _ = handle.emit("import_complete", serde_json::json!({ "total": 1 }));
     Ok(target_path_str)
 }
@@ -3496,9 +4619,13 @@ pub async fn check_duplicate(
         let sha256 = image_hash::compute_sha256(&file_path)?;
         if let Some(existing) = crud::find_by_sha256(&conn, &sha256).map_err(|e| e.to_string())? {
             let (source_folder, category_name) =
-                crud::get_media_duplicate_placement(&conn, &existing.id).map_err(|e| e.to_string())?;
+                crud::get_media_duplicate_placement(&conn, &existing.id)
+                    .map_err(|e| e.to_string())?;
             let pending_preview = read_pending_import_preview_data_url(&file_path).ok();
-            log::debug!("[check_duplicate] Exact duplicate found: {}", existing.filename);
+            log::debug!(
+                "[check_duplicate] Exact duplicate found: {}",
+                existing.filename
+            );
             return Ok(DuplicateCheckResult {
                 duplicate_type: Some("exact".to_string()),
                 existing_item: Some(existing),
@@ -3542,18 +4669,24 @@ pub async fn check_duplicate(
             let phash = image_hash::compute_phash(&file_path).map_err(|e| e.to_string())?;
 
             // æŸ¥æ‰¾æ±‰æ˜Žè·ç¦» â‰¤ 3 çš„è®°å½•
-            let matches = crud::find_by_phash_threshold(&conn, phash, 3).map_err(|e| e.to_string())?;
+            let matches =
+                crud::find_by_phash_threshold(&conn, phash, 3).map_err(|e| e.to_string())?;
 
             if let Some(existing) = matches.into_iter().next() {
                 let (source_folder, category_name) =
-                    crud::get_media_duplicate_placement(&conn, &existing.id).map_err(|e| e.to_string())?;
+                    crud::get_media_duplicate_placement(&conn, &existing.id)
+                        .map_err(|e| e.to_string())?;
                 let similarity = if let Some(existing_phash) = existing.phash {
                     image_hash::similarity_score(phash, existing_phash as u64) / 100.0
                 } else {
                     0.0
                 };
                 let pending_preview = read_pending_import_preview_data_url(&file_path).ok();
-                log::debug!("[check_duplicate] Similar duplicate found: {} (similarity: {:.2})", existing.filename, similarity);
+                log::debug!(
+                    "[check_duplicate] Similar duplicate found: {} (similarity: {:.2})",
+                    existing.filename,
+                    similarity
+                );
                 return Ok(DuplicateCheckResult {
                     duplicate_type: Some("similar".to_string()),
                     existing_item: Some(existing),
@@ -3583,8 +4716,8 @@ pub async fn check_duplicate(
 /// èŽ·å–æ–‡ä»¶åŸºæœ¬ä¿¡æ¯ï¼ˆå¤§å°ï¼‰
 #[command]
 pub async fn get_file_info(path: String) -> Result<FileInfo, String> {
-    let metadata = std::fs::metadata(&path)
-        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+    let metadata =
+        std::fs::metadata(&path).map_err(|e| format!("Failed to read file metadata: {}", e))?;
 
     Ok(FileInfo {
         size: metadata.len() as i64,
@@ -3599,7 +4732,10 @@ pub async fn replace_file(
     source_path: String,
     target_id: String,
 ) -> Result<(), String> {
-    eprintln!("[replace_file] Replacing {} with {}", target_id, source_path);
+    eprintln!(
+        "[replace_file] Replacing {} with {}",
+        target_id, source_path
+    );
 
     let db = db_path(&handle)?;
     let library_root = library_root(&handle)?;
@@ -3609,16 +4745,20 @@ pub async fn replace_file(
         .to_string_lossy()
         .to_string();
 
-
-
-
     // èŽ·å–ç›®æ ‡æ–‡ä»¶ä¿¡æ¯
+    let library_root_for_detail = library_root.clone();
     let (target_filepath, target_filename) = tokio::task::spawn_blocking({
         let db = db.clone();
         let target_id = target_id.clone();
+        let root = library_root_for_detail;
         move || {
             let conn = open_conn(&db).map_err(|e| e.to_string())?;
-            let detail = crud::get_media_detail(&conn, &target_id)
+            let root_opt = if root.trim().is_empty() {
+                None
+            } else {
+                Some(root.as_str())
+            };
+            let detail = crud::get_media_detail(&conn, &target_id, root_opt)
                 .map_err(|e: anyhow::Error| e.to_string())?
                 .ok_or_else(|| "Target file not found".to_string())?;
             let target_filename = detail.file.filename.clone();
@@ -3641,7 +4781,10 @@ pub async fn replace_file(
         let _ = std::fs::remove_file(&tmp_path);
         return Err(format!("Failed to copy new file to tmp: {}", e));
     }
-    eprintln!("[replace_file] Copied new file to tmp: {}", tmp_path.display());
+    eprintln!(
+        "[replace_file] Copied new file to tmp: {}",
+        tmp_path.display()
+    );
 
     // 2. 原子性重命名 .tmp 为最终路径（在大多数平台上原子性覆盖旧文件）
     if let Err(e) = std::fs::rename(&tmp_path, &dest_path) {
@@ -3649,7 +4792,10 @@ pub async fn replace_file(
         let _ = std::fs::remove_file(&tmp_path);
         return Err(format!("Failed to rename tmp file to destination: {}", e));
     }
-    eprintln!("[replace_file] Renamed tmp to final path: {}", dest_path.display());
+    eprintln!(
+        "[replace_file] Renamed tmp to final path: {}",
+        dest_path.display()
+    );
     let dest_path_str = dest_path.to_string_lossy().to_string();
 
     // 3. 在数据库事务中删除旧记录并导入新记录
@@ -3667,9 +4813,17 @@ pub async fn replace_file(
         eprintln!("[replace_file] Deleted old DB record: {}", target_id_tx);
 
         // 导入新文件（同一事务内）
-        scanner::scan_single_file_with_conn(&tx, &dest_path_str_tx, &thumbs_dir_tx, &library_root_clone)
-            .map_err(|e| e.to_string())?;
-        eprintln!("[replace_file] Imported new file in transaction: {}", dest_path_str_tx);
+        scanner::scan_single_file_with_conn(
+            &tx,
+            &dest_path_str_tx,
+            &thumbs_dir_tx,
+            &library_root_clone,
+        )
+        .map_err(|e| e.to_string())?;
+        eprintln!(
+            "[replace_file] Imported new file in transaction: {}",
+            dest_path_str_tx
+        );
 
         tx.commit().map_err(|e| e.to_string())?;
         eprintln!("[replace_file] Transaction committed");
@@ -3695,7 +4849,6 @@ pub fn check_ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
-
 /// è¡¥å……è®¡ç®—å·²æœ‰å›¾ç‰‡çš„ sha256 å’Œ phashï¼ˆåŽå°æ‰¹é‡å¤„ç†ï¼‰
 #[command]
 pub async fn backfill_file_hashes(handle: AppHandle) -> Result<String, String> {
@@ -3715,18 +4868,31 @@ pub async fn backfill_file_hashes(handle: AppHandle) -> Result<String, String> {
                 break;
             }
 
-            eprintln!("[backfill_file_hashes] Processing batch of {} files", batch.len());
+            eprintln!(
+                "[backfill_file_hashes] Processing batch of {} files",
+                batch.len()
+            );
 
             for (id, filepath) in batch {
-                match (image_hash::compute_sha256(&filepath), image_hash::compute_phash(&filepath)) {
+                match (
+                    image_hash::compute_sha256(&filepath),
+                    image_hash::compute_phash(&filepath),
+                ) {
                     (Ok(sha256), Ok(phash)) => {
-                        if let Err(e) = crud::update_file_hashes(&conn, &id, &sha256, phash as i64) {
-                            eprintln!("[backfill_file_hashes] Failed to update hashes for {}: {}", id, e);
+                        if let Err(e) = crud::update_file_hashes(&conn, &id, &sha256, phash as i64)
+                        {
+                            eprintln!(
+                                "[backfill_file_hashes] Failed to update hashes for {}: {}",
+                                id, e
+                            );
                             total_errors += 1;
                         }
                     }
                     (Err(e), _) | (_, Err(e)) => {
-                        eprintln!("[backfill_file_hashes] Failed to compute hash for {}: {}", filepath, e);
+                        eprintln!(
+                            "[backfill_file_hashes] Failed to compute hash for {}: {}",
+                            filepath, e
+                        );
                         total_errors += 1;
                     }
                 }
@@ -3735,8 +4901,14 @@ pub async fn backfill_file_hashes(handle: AppHandle) -> Result<String, String> {
         }
 
         let remaining = crud::count_missing_hashes(&conn).unwrap_or(-1);
-        eprintln!("[backfill_file_hashes] Done. Processed: {}, Errors: {}, Remaining: {}", total_processed, total_errors, remaining);
-        Ok(format!("Processed: {}, Errors: {}, Remaining: {}", total_processed, total_errors, remaining))
+        eprintln!(
+            "[backfill_file_hashes] Done. Processed: {}, Errors: {}, Remaining: {}",
+            total_processed, total_errors, remaining
+        );
+        Ok(format!(
+            "Processed: {}, Errors: {}, Remaining: {}",
+            total_processed, total_errors, remaining
+        ))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -4012,7 +5184,10 @@ pub async fn regenerate_all_thumbnails(handle: AppHandle) -> Result<String, Stri
     .await
     .map_err(|e| format!("Task join error: {}", e))??;
 
-    eprintln!("[regenerate_all_thumbnails] Cleared {} thumbnail files", thumbs_cleared);
+    eprintln!(
+        "[regenerate_all_thumbnails] Cleared {} thumbnail files",
+        thumbs_cleared
+    );
 
     // æ­¥éª¤ 2: æ¸…ç©ºæ•°æ®åº“ä¸­çš„ thumbnail_path
     let db_cleared = tokio::task::spawn_blocking({
@@ -4026,7 +5201,10 @@ pub async fn regenerate_all_thumbnails(handle: AppHandle) -> Result<String, Stri
     .await
     .map_err(|e| format!("Task join error: {}", e))??;
 
-    eprintln!("[regenerate_all_thumbnails] Cleared {} thumbnail paths from DB", db_cleared);
+    eprintln!(
+        "[regenerate_all_thumbnails] Cleared {} thumbnail paths from DB",
+        db_cleared
+    );
 
     // æ­¥éª¤ 3: æŸ¥è¯¢æ‰€æœ‰å›¾ç‰‡æ–‡ä»¶
     let image_files = tokio::task::spawn_blocking({
@@ -4041,7 +5219,10 @@ pub async fn regenerate_all_thumbnails(handle: AppHandle) -> Result<String, Stri
     .map_err(|e| format!("Task join error: {}", e))??;
 
     let total_files = image_files.len();
-    eprintln!("[regenerate_all_thumbnails] Found {} image files to regenerate", total_files);
+    eprintln!(
+        "[regenerate_all_thumbnails] Found {} image files to regenerate",
+        total_files
+    );
 
     // æ­¥éª¤ 4: æ·»åŠ åˆ°ç¼©ç•¥å›¾é˜Ÿåˆ—
     let thumbnail_queue = {
@@ -4111,11 +5292,9 @@ pub async fn regenerate_missing_micro(
     result
 }
 
-fn micro_backfill_scope_is_priority(
-    source_folder: Option<&str>,
-    active_nav: Option<&str>,
-) -> bool {
-    matches!(source_folder.map(str::trim), Some("灵感库")) || matches!(active_nav.map(str::trim), Some("library"))
+fn micro_backfill_scope_is_priority(source_folder: Option<&str>, active_nav: Option<&str>) -> bool {
+    matches!(source_folder.map(str::trim), Some("灵感库"))
+        || matches!(active_nav.map(str::trim), Some("library"))
 }
 
 /// 后台补齐旧库图片的 micro 缩略图，仅修复缺失或尺寸过小的旧 micro。
@@ -4137,10 +5316,14 @@ pub async fn run_micro_backfill(
     }
 
     let db_path = db.to_string();
-    let source_folder = source_folder.map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
-    let active_nav = active_nav.map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
+    let source_folder = source_folder
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let active_nav = active_nav
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let library_root_filter = library_root(handle).ok().map(|root| format!("{}%", root));
-    let files = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String, Option<String>, Option<String>)>, String> {
+    let files = tokio::task::spawn_blocking(move || -> Result<Vec<StartupBackfillRow>, String> {
         let conn = open_conn(&db_path).map_err(|e| e.to_string())?;
         let mut stmt = if library_root_filter.is_some() {
             conn.prepare(
@@ -4215,25 +5398,31 @@ pub async fn run_micro_backfill(
     let mut processed = 0usize;
     let mut last_emit = 0usize;
 
-    for (media_id, _filepath, thumbnail_path, thumbnail_micro_path) in files.into_iter().take(total_to_process) {
+    for (media_id, filepath, thumbnail_path, thumbnail_micro_path) in
+        files.into_iter().take(total_to_process)
+    {
         if shutdown.load(Ordering::Relaxed) {
             log::warn!("[startup_backfill] cancelled by shutdown signal");
             break;
         }
 
-        let thumbnail_path = if let Some(path) = thumbnail_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-            path
-        } else {
-            processed += 1;
-            continue;
-        };
-
-        let thumbnail_path_buf = std::path::PathBuf::from(thumbnail_path);
-        if !thumbnail_path_buf.is_file() {
-            log::warn!("[startup_backfill] thumbnail_path missing or invalid: {}", thumbnail_path);
+        let source_path = filepath.trim();
+        if source_path.is_empty() || !std::path::Path::new(source_path).is_file() {
             processed += 1;
             continue;
         }
+
+        let source_path_buf = std::path::PathBuf::from(source_path);
+        let parent_dir = source_path_buf
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let meta_dir = parent_dir.join(".nocturne_meta");
+        let _ = std::fs::create_dir_all(&meta_dir);
+
+        let base_name = source_path_buf
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&media_id);
 
         let thumbnail_micro_path_buf = thumbnail_micro_path
             .as_deref()
@@ -4243,10 +5432,16 @@ pub async fn run_micro_backfill(
 
         let micro_needs_regen = match thumbnail_micro_path_buf.as_ref() {
             None => true,
-            Some(existing_micro_path) => match image::image_dimensions(existing_micro_path) {
-                Ok((width, height)) => width.max(height) < 512,
-                Err(_) => true,
-            },
+            Some(existing_micro_path) => {
+                if !existing_micro_path.is_file() {
+                    true
+                } else {
+                    match image::image_dimensions(existing_micro_path) {
+                        Ok((width, height)) => width.max(height) < 512,
+                        Err(_) => true,
+                    }
+                }
+            }
         };
 
         if !micro_needs_regen {
@@ -4254,42 +5449,47 @@ pub async fn run_micro_backfill(
             continue;
         }
 
-        let thumbnail_filename = match thumbnail_path_buf.file_name().and_then(|n| n.to_str()) {
-            Some(name) => name,
-            None => {
-                processed += 1;
-                continue;
-            }
-        };
-        let micro_filename = if let Some(stripped) = thumbnail_filename.strip_suffix("_thumb.jpg") {
-            format!("{}_micro.webp", stripped)
-        } else if let Some(stripped) = thumbnail_filename.strip_suffix("_thumb.webp") {
-            format!("{}_micro.webp", stripped)
-        } else if thumbnail_filename.ends_with("_micro.webp") {
-            thumbnail_filename.to_string()
-        } else {
-            processed += 1;
-            continue;
+        let micro_dst = match thumbnail_micro_path_buf {
+            Some(p) if p.is_file() => p,
+            _ => meta_dir.join(format!("{}_micro.webp", base_name)),
         };
 
-        let micro_dst = thumbnail_micro_path_buf.unwrap_or_else(|| thumbnail_path_buf.with_file_name(micro_filename));
+        let thumbnail_src_for_task = thumbnail_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| source_path_buf.clone());
+
         let db_path_for_task = db_path.clone();
         let media_id_for_task = media_id.clone();
-        let thumbnail_src_for_task = thumbnail_path_buf.clone();
         let micro_dst_for_task = micro_dst.clone();
+        let source_path_owned = source_path.to_string();
 
         let _ = tokio::task::spawn_blocking(move || -> Result<bool, String> {
             if let Some(parent) = micro_dst_for_task.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
 
-            let micro_path_owned = if micro_dst_for_task.exists() {
+            let micro_path_owned = if micro_dst_for_task.is_file() {
                 Some(micro_dst_for_task.to_string_lossy().to_string())
             } else {
-                let generated = crate::media::thumbnail::generate_micro_thumbnail(&thumbnail_src_for_task, &micro_dst_for_task)
-                    .map(|_| micro_dst_for_task.exists())
-                    .unwrap_or(false);
-                if generated {
+                let from_embedded = crate::media::thumbnail::generate_micro_from_embedded_thumbnail(
+                    &source_path_owned,
+                    &micro_dst_for_task,
+                );
+                let generated = if from_embedded.is_some() {
+                    true
+                } else {
+                    crate::media::thumbnail::generate_micro_thumbnail(
+                        &thumbnail_src_for_task,
+                        &micro_dst_for_task,
+                    )
+                    .map(|_| micro_dst_for_task.is_file())
+                    .unwrap_or(false)
+                };
+                if generated && micro_dst_for_task.is_file() {
                     Some(micro_dst_for_task.to_string_lossy().to_string())
                 } else {
                     None
@@ -4318,10 +5518,13 @@ pub async fn run_micro_backfill(
         processed += 1;
         if processed - last_emit >= 50 {
             last_emit = processed;
-            let _ = app.emit("startup_backfill_progress", serde_json::json!({
-                "current": processed,
-                "total": total,
-            }));
+            let _ = app.emit(
+                "startup_backfill_progress",
+                serde_json::json!({
+                    "current": processed,
+                    "total": total,
+                }),
+            );
         }
 
         if processed >= total_to_process {
@@ -4330,15 +5533,180 @@ pub async fn run_micro_backfill(
     }
 
     let remaining = total.saturating_sub(processed);
-    let _ = app.emit("startup_backfill_complete", serde_json::json!({
-        "processed": processed,
-        "remaining": remaining,
-    }));
-    log::info!("[startup_backfill] done, processed={}, remaining={}", processed, remaining);
+    let _ = app.emit(
+        "startup_backfill_complete",
+        serde_json::json!({
+            "processed": processed,
+            "remaining": remaining,
+        }),
+    );
+    log::info!(
+        "[startup_backfill] done, processed={}, remaining={}",
+        processed,
+        remaining
+    );
     Ok(format!("processed={}, remaining={}", processed, remaining))
 }
 
-/// å¼ºåˆ¶æ¸…ç©ºç¼©ç•¥å›¾ç›®å½•å’Œæ•°æ®åº“å­—æ®µ
+/// 启动后补全 design/document 源文件缩略图（PSD 内嵌 + Quick Look / Shell）。
+pub async fn run_design_source_backfill(
+    handle: &AppHandle,
+    db: &str,
+    shutdown: Arc<AtomicBool>,
+    initial_delay_secs: u64,
+    max_items: Option<usize>,
+) -> Result<String, String> {
+    if initial_delay_secs > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(initial_delay_secs)).await;
+    }
+    if shutdown.load(Ordering::Relaxed) {
+        return Ok("[design_backfill] cancelled".to_string());
+    }
+
+    let library_root = library_root(handle).unwrap_or_default();
+    let db_path = db.to_string();
+    let root_trim = library_root.trim().to_string();
+
+    let candidates = tokio::task::spawn_blocking(
+        move || -> Result<Vec<(String, String, String, String)>, String> {
+            let conn = open_conn(&db_path).map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, filepath, filename, filetype
+                 FROM media_files
+                 WHERE is_trashed = 0
+                   AND filetype IN ('design', 'document')
+                 ORDER BY imported_at DESC, id DESC",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())?;
+
+            let mut out = Vec::new();
+            for (id, filepath, filename, filetype) in rows {
+                let ext = std::path::Path::new(&filepath)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if !crate::media::design_source::needs_source_preview_for_filetype_and_ext(
+                    &filetype, &ext,
+                ) {
+                    continue;
+                }
+                out.push((id, filepath, filename, filetype));
+            }
+            Ok(out)
+        },
+    )
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
+
+    let limit = max_items.unwrap_or(200).min(500);
+    let app = handle.clone();
+    let mut processed = 0usize;
+    let mut changed = 0usize;
+
+    for (media_id, filepath, filename, filetype) in candidates.into_iter().take(limit) {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let db_clone = db.to_string();
+        let root_clone = root_trim.clone();
+        let id_clone = media_id.clone();
+        let fp_clone = filepath.clone();
+        let name_clone = filename.clone();
+        let ft_clone = filetype.clone();
+
+        let did_change = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            let conn = open_conn(&db_clone).map_err(|e| e.to_string())?;
+            let file = crud::get_media_file_by_id(&conn, &id_clone).map_err(|e| e.to_string())?;
+            if crate::media::design_source::has_modern_webp_tiers(
+                file.thumbnail_micro_path.as_deref(),
+                file.thumbnail_path.as_deref(),
+                file.thumbnail_preview_path.as_deref(),
+            ) {
+                return Ok(false);
+            }
+
+            let root_opt = if root_clone.is_empty() {
+                None
+            } else {
+                Some(root_clone.as_str())
+            };
+            let Some(resolved) = crate::media::path_util::resolve_media_file_on_disk(
+                &fp_clone,
+                root_opt,
+                Some(&name_clone),
+            ) else {
+                return Ok(false);
+            };
+            let disk_path = resolved.to_string_lossy().to_string();
+            if disk_path != fp_clone {
+                let _ = conn.execute(
+                    "UPDATE media_files SET filepath = ?1 WHERE id = ?2",
+                    rusqlite::params![disk_path, id_clone],
+                );
+            }
+
+            let ext = crate::media::design_source::ext_lower_from_path(&resolved);
+            let meta_dir = resolved
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join(".nocturne_meta");
+
+            let before_micro = file.thumbnail_micro_path.clone();
+            let before_std = file.thumbnail_path.clone();
+
+            let _ = crate::media::design_source::ensure_source_preview_thumbnails(
+                &id_clone,
+                &disk_path,
+                &name_clone,
+                &meta_dir,
+                &db_clone,
+                &ft_clone,
+                &ext,
+            );
+
+            let after = crud::get_media_file_by_id(&conn, &id_clone).map_err(|e| e.to_string())?;
+            Ok(after.thumbnail_micro_path != before_micro || after.thumbnail_path != before_std)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))??;
+
+        processed += 1;
+        if did_change {
+            changed += 1;
+            let _ = app.emit(
+                "media_metadata_updated",
+                serde_json::json!({ "id": media_id }),
+            );
+        }
+    }
+
+    log::info!(
+        "[design_backfill] done processed={} changed={}",
+        processed,
+        changed
+    );
+    Ok(format!(
+        "design_backfill processed={} changed={}",
+        processed, changed
+    ))
+}
+
+/// 强制清空缩略图目录和数据库字段
 #[command]
 pub async fn force_clear_thumbnails(handle: AppHandle) -> Result<String, String> {
     eprintln!("[force_clear_thumbnails] Force clearing all thumbnails");
@@ -4386,7 +5754,10 @@ pub async fn force_clear_thumbnails(handle: AppHandle) -> Result<String, String>
     .await
     .map_err(|e| format!("Task join error: {}", e))??;
 
-    eprintln!("[force_clear_thumbnails] Cleared {} thumbnail files", thumbs_cleared);
+    eprintln!(
+        "[force_clear_thumbnails] Cleared {} thumbnail files",
+        thumbs_cleared
+    );
 
     // æ­¥éª¤ 2: æ¸…ç©ºæ•°æ®åº“ä¸­çš„ thumbnail_path å’Œ color_dominant
     let db_cleared = tokio::task::spawn_blocking({
@@ -4395,16 +5766,14 @@ pub async fn force_clear_thumbnails(handle: AppHandle) -> Result<String, String>
             let conn = open_conn(&db).map_err(|e| e.to_string())?;
 
             // æ¸…ç©º thumbnail_path
-            let thumb_count = conn.execute(
-                "UPDATE media_files SET thumbnail_path = NULL",
-                [],
-            ).map_err(|e| e.to_string())?;
+            let thumb_count = conn
+                .execute("UPDATE media_files SET thumbnail_path = NULL", [])
+                .map_err(|e| e.to_string())?;
 
             // æ¸…ç©º color_dominant
-            let color_count = conn.execute(
-                "UPDATE media_files SET color_dominant = NULL",
-                [],
-            ).map_err(|e| e.to_string())?;
+            let color_count = conn
+                .execute("UPDATE media_files SET color_dominant = NULL", [])
+                .map_err(|e| e.to_string())?;
 
             Ok((thumb_count, color_count))
         }
@@ -4412,7 +5781,10 @@ pub async fn force_clear_thumbnails(handle: AppHandle) -> Result<String, String>
     .await
     .map_err(|e| format!("Task join error: {}", e))??;
 
-    eprintln!("[force_clear_thumbnails] Cleared {} thumbnail paths and {} color records from DB", db_cleared.0, db_cleared.1);
+    eprintln!(
+        "[force_clear_thumbnails] Cleared {} thumbnail paths and {} color records from DB",
+        db_cleared.0, db_cleared.1
+    );
 
     let message = format!(
         "已清空缩略图数据\n文件: {} 个\n数据库: {} 条缩略图记录, {} 条颜色记录",
@@ -4435,7 +5807,8 @@ pub async fn emergency_cleanup_invalid_files(handle: AppHandle) -> Result<String
         let db = db.clone();
         move || -> Result<Vec<(String, String)>, String> {
             let conn = open_conn(&db).map_err(|e| e.to_string())?;
-            let mut stmt = conn.prepare("SELECT id, filepath FROM media_files")
+            let mut stmt = conn
+                .prepare("SELECT id, filepath FROM media_files")
                 .map_err(|e| e.to_string())?;
             let files: Vec<(String, String)> = stmt
                 .query_map([], |row| {
@@ -4451,7 +5824,10 @@ pub async fn emergency_cleanup_invalid_files(handle: AppHandle) -> Result<String
     .map_err(|e| format!("Task join error: {}", e))??;
 
     let total_files = files_to_check.len();
-    eprintln!("[emergency_cleanup] Total files in database: {}", total_files);
+    eprintln!(
+        "[emergency_cleanup] Total files in database: {}",
+        total_files
+    );
 
     // æ‰¾å‡ºä¸åœ¨åº“æ ¹ç›®å½•ä¸‹çš„æ–‡ä»¶
     let mut invalid_ids = Vec::new();
@@ -4466,13 +5842,19 @@ pub async fn emergency_cleanup_invalid_files(handle: AppHandle) -> Result<String
         if is_valid {
             valid_count += 1;
         } else {
-            eprintln!("[emergency_cleanup] Invalid file path: {} (id: {})", filepath, id);
+            eprintln!(
+                "[emergency_cleanup] Invalid file path: {} (id: {})",
+                filepath, id
+            );
             invalid_ids.push(id);
         }
     }
 
     let invalid_count = invalid_ids.len();
-    eprintln!("[emergency_cleanup] Found {} valid files, {} invalid files", valid_count, invalid_count);
+    eprintln!(
+        "[emergency_cleanup] Found {} valid files, {} invalid files",
+        valid_count, invalid_count
+    );
 
     // åˆ é™¤æ— æ•ˆè®°å½•
     if !invalid_ids.is_empty() {
@@ -4524,7 +5906,8 @@ pub async fn get_all_file_paths(handle: AppHandle) -> Result<Vec<(String, String
 
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
-        let mut stmt = conn.prepare("SELECT id, filepath FROM media_files ORDER BY filepath")
+        let mut stmt = conn
+            .prepare("SELECT id, filepath FROM media_files ORDER BY filepath")
             .map_err(|e| e.to_string())?;
         let files: Vec<(String, String)> = stmt
             .query_map([], |row| {
@@ -4607,7 +5990,7 @@ fn repair_missing_dimensions_for_library_root(
          WHERE filetype = 'image'
            AND (width IS NULL OR height IS NULL OR width <= 0 OR height <= 0)
            AND filepath LIKE ?1
-         ORDER BY imported_at ASC, id ASC"
+         ORDER BY imported_at ASC, id ASC",
     )?;
 
     let items: Vec<(String, String)> = stmt
@@ -4615,7 +5998,10 @@ fn repair_missing_dimensions_for_library_root(
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let total = items.len();
-    eprintln!("[repair_missing_dimensions] Found {} images with missing dimensions", total);
+    eprintln!(
+        "[repair_missing_dimensions] Found {} images with missing dimensions",
+        total
+    );
 
     if total == 0 {
         return Ok(0);
@@ -4632,16 +6018,25 @@ fn repair_missing_dimensions_for_library_root(
                     eprintln!("[repair_missing_dimensions] Failed to update {}: {}", id, e);
                 } else {
                     repaired += 1;
-                    eprintln!("[repair_missing_dimensions] Repaired {}: {}x{}", id, width, height);
+                    eprintln!(
+                        "[repair_missing_dimensions] Repaired {}: {}x{}",
+                        id, width, height
+                    );
                 }
             }
             Err(e) => {
-                eprintln!("[repair_missing_dimensions] Failed to read dimensions for {}: {}", filepath, e);
+                eprintln!(
+                    "[repair_missing_dimensions] Failed to read dimensions for {}: {}",
+                    filepath, e
+                );
             }
         }
     }
 
-    eprintln!("[repair_missing_dimensions] Repair completed: {}/{} fixed", repaired, total);
+    eprintln!(
+        "[repair_missing_dimensions] Repair completed: {}/{} fixed",
+        repaired, total
+    );
     Ok(repaired)
 }
 
@@ -4661,6 +6056,42 @@ pub async fn repair_missing_dimensions(handle: AppHandle) -> Result<u32, String>
     .map_err(|e| format!("Task join error: {}", e))?
 }
 
+/// 从库内原图读取宽高（仅 header，供 Masonry 布局；不依赖 micro 缩略图像素）
+#[command]
+pub async fn probe_image_dimensions(
+    handle: AppHandle,
+    id: String,
+) -> Result<Option<(i32, i32)>, String> {
+    let db = db_path(&handle)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = open_conn(&db).map_err(|e| e.to_string())?;
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT filepath, filetype FROM media_files WHERE id = ?",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((filepath, filetype)) = row else {
+            return Ok(None);
+        };
+        if filetype != "image" {
+            return Ok(None);
+        }
+        let path = std::path::Path::new(&filepath);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        match image::image_dimensions(path) {
+            Ok((w, h)) if w > 0 && h > 0 => Ok(Some((w as i32, h as i32))),
+            _ => Ok(None),
+        }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
+}
+
 /// 更新媒体文件的尺寸信息
 #[command]
 pub async fn update_media_dimensions(
@@ -4669,7 +6100,10 @@ pub async fn update_media_dimensions(
     width: i32,
     height: i32,
 ) -> Result<(), String> {
-    eprintln!("[update_media_dimensions] Updating dimensions for {}: {}x{}", id, width, height);
+    eprintln!(
+        "[update_media_dimensions] Updating dimensions for {}: {}x{}",
+        id, width, height
+    );
 
     let db = db_path(&handle)?;
 
@@ -4682,7 +6116,10 @@ pub async fn update_media_dimensions(
         )
         .map_err(|e| format!("Failed to update dimensions: {}", e))?;
 
-        eprintln!("[update_media_dimensions] Dimensions updated successfully for {}", id);
+        eprintln!(
+            "[update_media_dimensions] Dimensions updated successfully for {}",
+            id
+        );
         Ok(())
     })
     .await

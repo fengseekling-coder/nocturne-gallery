@@ -17,30 +17,51 @@ use webp::Encoder;
 pub fn extract_psd_thumbnail_jpeg(filepath: &str) -> Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut f = std::fs::File::open(filepath)
-        .with_context(|| format!("Failed to open PSD: {}", filepath))?;
+    let disk = crate::media::path_util::resolve_regular_file_path(filepath)
+        .ok_or_else(|| anyhow::anyhow!("PSD not found on disk: {}", filepath))?;
+    let open_path = disk.to_string_lossy().to_string();
+
+    let mut f = std::fs::File::open(&open_path)
+        .with_context(|| format!("Failed to open PSD: {}", open_path))?;
 
     // ── Header (26 bytes) ──
     let mut hdr = [0u8; 26];
-    f.read_exact(&mut hdr).context("Failed to read PSD header")?;
+    f.read_exact(&mut hdr)
+        .context("Failed to read PSD header")?;
     if &hdr[0..4] != b"8BPS" {
         bail!("Not a valid PSD/PSB file");
     }
+    let version = u16::from_be_bytes([hdr[4], hdr[5]]);
+    let is_psb = version == 2;
 
     // ── Color Mode Data section ──
-    let mut len4 = [0u8; 4];
-    f.read_exact(&mut len4)?;
-    let cmode_len = u32::from_be_bytes(len4) as i64;
+    let cmode_len: i64 = if is_psb {
+        let mut len8 = [0u8; 8];
+        f.read_exact(&mut len8)?;
+        u64::from_be_bytes(len8) as i64
+    } else {
+        let mut len4 = [0u8; 4];
+        f.read_exact(&mut len4)?;
+        u32::from_be_bytes(len4) as i64
+    };
     f.seek(SeekFrom::Current(cmode_len))?;
 
     // ── Image Resources section ──
-    f.read_exact(&mut len4)?;
-    let imgres_len = u32::from_be_bytes(len4) as usize;
+    let imgres_len: usize = if is_psb {
+        let mut len8 = [0u8; 8];
+        f.read_exact(&mut len8)?;
+        u64::from_be_bytes(len8) as usize
+    } else {
+        let mut len4 = [0u8; 4];
+        f.read_exact(&mut len4)?;
+        u32::from_be_bytes(len4) as usize
+    };
 
     // 限制最大读取 32 MB，防止异常 PSD 导致 OOM
     let read_len = imgres_len.min(32 * 1024 * 1024);
     let mut imgres = vec![0u8; read_len];
-    f.read_exact(&mut imgres).context("Failed to read Image Resources")?;
+    f.read_exact(&mut imgres)
+        .context("Failed to read Image Resources")?;
 
     // ── 解析 Resource Block 列表 ──
     let mut pos = 0usize;
@@ -56,19 +77,37 @@ pub fn extract_psd_thumbnail_jpeg(filepath: &str) -> Result<Vec<u8>> {
         // Pascal string（长度字节 + 内容），整体对齐到偶数字节
         let name_len = imgres[pos] as usize;
         pos += 1;
-        let skip = if (name_len + 1) % 2 == 0 { name_len } else { name_len + 1 };
+        let skip = if (name_len + 1).is_multiple_of(2) {
+            name_len
+        } else {
+            name_len + 1
+        };
         pos += skip;
 
-        if pos + 4 > imgres.len() { break; }
-        let data_len = u32::from_be_bytes([imgres[pos], imgres[pos+1], imgres[pos+2], imgres[pos+3]]) as usize;
+        if pos + 4 > imgres.len() {
+            break;
+        }
+        let data_len = u32::from_be_bytes([
+            imgres[pos],
+            imgres[pos + 1],
+            imgres[pos + 2],
+            imgres[pos + 3],
+        ]) as usize;
         pos += 4;
 
-        if pos + data_len > imgres.len() { break; }
+        if pos + data_len > imgres.len() {
+            break;
+        }
 
         // Resource ID 1036 (0x040C) = Photoshop 5.0+ 缩略图
         // Resource ID 1033 (0x0409) = Photoshop 4.0 缩略图（格式相同）
         if (res_id == 1036 || res_id == 1033) && data_len >= 28 {
-            let format = u32::from_be_bytes([imgres[pos], imgres[pos+1], imgres[pos+2], imgres[pos+3]]);
+            let format = u32::from_be_bytes([
+                imgres[pos],
+                imgres[pos + 1],
+                imgres[pos + 2],
+                imgres[pos + 3],
+            ]);
             if format == 1 {
                 // 头部 28 字节是元数据，之后是 JPEG 数据
                 let jpeg = imgres[pos + 28..pos + data_len].to_vec();
@@ -79,11 +118,120 @@ pub fn extract_psd_thumbnail_jpeg(filepath: &str) -> Result<Vec<u8>> {
         }
 
         // 对齐到偶数字节，跳到下一个 block
-        let padded = if data_len % 2 != 0 { data_len + 1 } else { data_len };
+        let padded = if !data_len.is_multiple_of(2) {
+            data_len + 1
+        } else {
+            data_len
+        };
         pos += padded;
     }
 
     bail!("No embedded JPEG thumbnail found in PSD (resource 1036/1033 not present or format unsupported)")
+}
+
+/// 从 JPEG/PNG 等栅格字节生成 micro + standard WebP，写入 `.nocturne_meta` 并更新 DB。
+/// 用于 PSD 内嵌缩略图或 macOS Quick Look 回退。
+pub fn ensure_design_preview_from_raster_bytes(
+    media_id: &str,
+    filepath: &str,
+    filename: &str,
+    meta_dir: &Path,
+    db_path: &str,
+    raster_bytes: &[u8],
+) -> Option<String> {
+    if raster_bytes.is_empty() {
+        return None;
+    }
+    if std::fs::create_dir_all(meta_dir).is_err() {
+        return None;
+    }
+
+    let img = image::load_from_memory(raster_bytes).ok()?;
+    let (width, height) = img.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let micro_filename = format!("{}_micro.webp", filename);
+    let standard_filename = format!("{}_thumb.webp", filename);
+    let micro_dst = meta_dir.join(&micro_filename);
+    let standard_dst = meta_dir.join(&standard_filename);
+
+    if generate_micro_thumbnail_from_image(&img, &micro_dst).is_err() || !micro_dst.exists() {
+        return None;
+    }
+    if generate_standard_thumbnail_from_image(&img, &standard_dst).is_err()
+        || !standard_dst.exists()
+    {
+        return None;
+    }
+
+    let micro_abs = micro_dst.to_string_lossy().to_string();
+    let standard_abs = standard_dst.to_string_lossy().to_string();
+
+    let thumbhash_opt = generate_thumbhash_from_image(&img)
+        .ok()
+        .filter(|h| !h.is_empty());
+
+    if let Ok(conn) = open_conn(db_path) {
+        let _ = crud::update_media_dimensions(&conn, media_id, width as i64, height as i64);
+        let _ = update_multi_tier_thumbnails(
+            &conn,
+            media_id,
+            Some(&micro_abs),
+            Some(&standard_abs),
+            None,
+            thumbhash_opt.as_deref(),
+        );
+    }
+
+    let _ = filepath;
+    Some(standard_abs)
+}
+
+/// PSD/PSB：内嵌 JPEG → 多档 WebP；失败时用系统 Quick Look（macOS）。
+pub fn ensure_psd_design_thumbnails(
+    media_id: &str,
+    filepath: &str,
+    filename: &str,
+    meta_dir: &Path,
+    db_path: &str,
+) -> Option<String> {
+    if let Ok(jpeg) = extract_psd_thumbnail_jpeg(filepath) {
+        if let Some(path) = ensure_design_preview_from_raster_bytes(
+            media_id, filepath, filename, meta_dir, db_path, &jpeg,
+        ) {
+            return Some(path);
+        }
+    }
+
+    let legacy_jpg = meta_dir.join(format!("{}_thumb.jpg", filename));
+    if legacy_jpg.is_file() {
+        if let Ok(bytes) = std::fs::read(&legacy_jpg) {
+            if let Some(path) = ensure_design_preview_from_raster_bytes(
+                media_id, filepath, filename, meta_dir, db_path, &bytes,
+            ) {
+                return Some(path);
+            }
+        }
+        let abs = legacy_jpg.to_string_lossy().to_string();
+        if let Ok(conn) = open_conn(db_path) {
+            let _ = update_multi_tier_thumbnails(&conn, media_id, None, Some(&abs), None, None);
+        }
+        return Some(abs);
+    }
+
+    if let Some(bytes) = crate::media::os_preview::fetch_os_preview_bytes(filepath, 512) {
+        return ensure_design_preview_from_raster_bytes(
+            media_id, filepath, filename, meta_dir, db_path, &bytes,
+        );
+    }
+
+    log::warn!(
+        "[ensure_psd_design_thumbnails] No preview for {} (no embedded thumb, no legacy jpg, Quick Look failed)",
+        filename
+    );
+    None
 }
 
 // ─────────────────────────────────────────────
@@ -121,11 +269,16 @@ pub fn is_video_file(filepath: &str) -> bool {
 fn try_ffmpeg_extract(input: &str, output: &str, timestamp: &str) -> Result<()> {
     let status = std::process::Command::new("ffmpeg")
         .args([
-            "-i", input,
-            "-ss", timestamp,
-            "-vframes", "1",
-            "-vf", "scale=800:-1",
-            "-q:v", "2",
+            "-i",
+            input,
+            "-ss",
+            timestamp,
+            "-vframes",
+            "1",
+            "-vf",
+            "scale=800:-1",
+            "-q:v",
+            "2",
             output,
             "-y",
         ])
@@ -137,18 +290,18 @@ fn try_ffmpeg_extract(input: &str, output: &str, timestamp: &str) -> Result<()> 
     if status.success() && Path::new(output).exists() {
         Ok(())
     } else {
-        anyhow::bail!("ffmpeg exited with status {:?} or output not created at {}", status.code(), output)
+        anyhow::bail!(
+            "ffmpeg exited with status {:?} or output not created at {}",
+            status.code(),
+            output
+        )
     }
 }
 
 /// 用 ffmpeg 提取视频第一帧作为缩略图，保存到 `.nocturne_meta/{filename}_thumb.jpg`。
 /// 先尝试 1s 处提取，若失败（短视频）则 fallback 到 0s。
 /// ffmpeg 不可用时返回 Err，不 panic，不影响其他文件导入。
-pub fn generate_video_thumbnail(
-    media_id: &str,
-    filepath: &str,
-    db_path: &str,
-) -> Result<String> {
+pub fn generate_video_thumbnail(media_id: &str, filepath: &str, db_path: &str) -> Result<String> {
     generate_video_thumbnail_with_conn(media_id, filepath, db_path, None)
 }
 
@@ -158,7 +311,10 @@ pub fn generate_video_thumbnail_with_conn(
     db_path: &str,
     db_conn: Option<&rusqlite::Connection>,
 ) -> Result<String> {
-    eprintln!("[generate_video_thumbnail] Generating for media_id={}", media_id);
+    eprintln!(
+        "[generate_video_thumbnail] Generating for media_id={}",
+        media_id
+    );
 
     let file_path = Path::new(filepath);
     let parent_dir = file_path.parent().unwrap_or(Path::new("."));
@@ -203,8 +359,7 @@ pub fn generate_video_thumbnail_with_conn(
         prompt_text: None,
     };
     let json_path = meta_dir.join(format!("{}.json", filename));
-    let content = serde_json::to_string_pretty(&meta)
-        .context("Failed to serialize meta JSON")?;
+    let content = serde_json::to_string_pretty(&meta).context("Failed to serialize meta JSON")?;
     std::fs::write(&json_path, content)
         .with_context(|| format!("Failed to write meta JSON: {}", json_path.display()))?;
 
@@ -224,8 +379,8 @@ pub fn generate_thumbnail(src: &Path, dst: &Path) -> Result<()> {
 
 /// 生成主缩略图（800px，WebP q80）
 pub fn generate_standard_thumbnail(src: &Path, dst: &Path) -> Result<()> {
-    let img = image::open(src)
-        .with_context(|| format!("Failed to open image: {}", src.display()))?;
+    let img =
+        image::open(src).with_context(|| format!("Failed to open image: {}", src.display()))?;
 
     let thumb = img.thumbnail(STANDARD_SIZE, STANDARD_SIZE);
     write_webp_thumbnail(&thumb, dst, STANDARD_WEBP_QUALITY, "standard")
@@ -376,8 +531,8 @@ pub fn generate_thumbnail_and_meta_with_conn(
     std::fs::create_dir_all(&meta_dir)
         .with_context(|| format!("Failed to create .nocturne_meta: {}", meta_dir.display()))?;
 
-    let img = image::open(filepath)
-        .with_context(|| format!("Failed to open image: {}", filepath))?;
+    let img =
+        image::open(filepath).with_context(|| format!("Failed to open image: {}", filepath))?;
 
     let filename = file_path
         .file_name()
@@ -409,7 +564,8 @@ pub fn generate_thumbnail_and_meta_with_conn(
                 .context("Failed to update color_dominant")?;
         }
     } else {
-        let conn = open_conn(db_path).context("Failed to open DB in generate_thumbnail_and_meta")?;
+        let conn =
+            open_conn(db_path).context("Failed to open DB in generate_thumbnail_and_meta")?;
         crud::update_thumbnail_path(&conn, media_id, &standard_path_abs)
             .context("Failed to update thumbnail_path")?;
         if let Some(ref color) = color_hex {
@@ -444,14 +600,23 @@ pub fn generate_micro_from_embedded_thumbnail(_filepath: &str, _dst: &Path) -> O
 
 /// 生成 Micro 档缩略图（512px 长边，WebP q76）
 pub fn generate_micro_thumbnail(src: &Path, dst: &Path) -> Result<()> {
-    if src.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) == Some("svg".to_string()) {
+    if src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        == Some("svg".to_string())
+    {
         std::fs::copy(src, dst)
             .with_context(|| format!("Failed to copy SVG to: {}", dst.display()))?;
         return Ok(());
     }
 
-    let img = image::open(src)
-        .with_context(|| format!("Failed to open image for micro thumbnail: {}", src.display()))?;
+    let img = image::open(src).with_context(|| {
+        format!(
+            "Failed to open image for micro thumbnail: {}",
+            src.display()
+        )
+    })?;
 
     write_micro_thumbnail(&img, dst)?;
     Ok(())
@@ -479,9 +644,15 @@ fn write_micro_thumbnail(img: &DynamicImage, dst: &Path) -> Result<bool> {
         if metadata.len() > 0 {
             return Ok(true);
         }
-        eprintln!("[write_micro_thumbnail] micro file exists but is empty: {}", dst.display());
+        eprintln!(
+            "[write_micro_thumbnail] micro file exists but is empty: {}",
+            dst.display()
+        );
     } else {
-        eprintln!("[write_micro_thumbnail] micro file missing after write: {}", dst.display());
+        eprintln!(
+            "[write_micro_thumbnail] micro file missing after write: {}",
+            dst.display()
+        );
     }
 
     Ok(false)
@@ -493,7 +664,11 @@ fn write_webp_thumbnail(thumb: &DynamicImage, dst: &Path, quality: f32, kind: &s
     let memory = encoder.encode(quality);
     let bytes: &[u8] = memory.as_ref();
     if bytes.is_empty() {
-        bail!("webp encoder produced empty {} thumbnail for {}", kind, dst.display());
+        bail!(
+            "webp encoder produced empty {} thumbnail for {}",
+            kind,
+            dst.display()
+        );
     }
 
     std::fs::write(dst, bytes)
@@ -502,7 +677,11 @@ fn write_webp_thumbnail(thumb: &DynamicImage, dst: &Path, quality: f32, kind: &s
     let metadata = std::fs::metadata(dst)
         .with_context(|| format!("Failed to stat {} thumbnail: {}", kind, dst.display()))?;
     if metadata.len() == 0 {
-        bail!("{} thumbnail written but file is empty: {}", kind, dst.display());
+        bail!(
+            "{} thumbnail written but file is empty: {}",
+            kind,
+            dst.display()
+        );
     }
 
     Ok(())
@@ -535,7 +714,7 @@ pub fn generate_thumbhash_from_image(img: &DynamicImage) -> Result<String> {
     let hash_bytes = fast_thumbhash::rgba_to_thumb_hash(width as usize, height as usize, &rgba);
 
     // 转换为 Base64 字符串（便于存储在数据库中）
-    use base64::{Engine as _, engine::general_purpose};
+    use base64::{engine::general_purpose, Engine as _};
     Ok(general_purpose::STANDARD.encode(&hash_bytes))
 }
 
@@ -549,22 +728,36 @@ pub fn update_multi_tier_thumbnails(
     thumbhash: Option<&str>,
 ) -> Result<()> {
     let thumbhash = thumbhash.filter(|hash| !hash.is_empty());
-    if micro_path.is_none() && standard_path.is_none() && preview_path.is_none() && thumbhash.is_none() {
+    if micro_path.is_none()
+        && standard_path.is_none()
+        && preview_path.is_none()
+        && thumbhash.is_none()
+    {
         return Ok(());
     }
 
-    log::debug!("[update_multi_tier] EXECUTING UPDATE for id={} micro={:?} thumbhash={:?}",
-        media_id, micro_path, thumbhash.as_ref().map(|h| &h[..8.min(h.len())]));
-    let rows = conn.execute(
-        "UPDATE media_files
+    log::debug!(
+        "[update_multi_tier] EXECUTING UPDATE for id={} micro={:?} thumbhash={:?}",
+        media_id,
+        micro_path,
+        thumbhash.as_ref().map(|h| &h[..8.min(h.len())])
+    );
+    let rows = conn
+        .execute(
+            "UPDATE media_files
          SET thumbnail_micro_path = COALESCE(?1, thumbnail_micro_path),
              thumbnail_path = COALESCE(?2, thumbnail_path),
              thumbnail_preview_path = COALESCE(?3, thumbnail_preview_path),
              thumbhash = COALESCE(?4, thumbhash)
          WHERE id = ?5",
-        rusqlite::params![micro_path, standard_path, preview_path, thumbhash, media_id],
-    ).with_context(|| "Failed to update multi-tier thumbnail fields in DB")?;
-    log::debug!("[update_multi_tier] rows_affected={} for id={}", rows, media_id);
+            rusqlite::params![micro_path, standard_path, preview_path, thumbhash, media_id],
+        )
+        .with_context(|| "Failed to update multi-tier thumbnail fields in DB")?;
+    log::debug!(
+        "[update_multi_tier] rows_affected={} for id={}",
+        rows,
+        media_id
+    );
 
     Ok(())
 }

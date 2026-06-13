@@ -1,19 +1,17 @@
-/**
- * Nocturne Gallery — AI Agent 工具调用命令
- *
- * 为前端 AI Agent 提供操作库内素材的能力，
- * 包括搜索、标签管理、分类、提示词更新等。
- */
+//! Gega Gallery — AI Agent 工具调用命令
+//!
+//! 为前端 AI Agent 提供操作库内素材的能力，
+//! 包括搜索、标签管理、分类、提示词更新等。
 
-use tauri::AppHandle;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use tauri::AppHandle;
 
 use super::db_path;
 use crate::db::{crud, open_conn};
-use crate::models::{ItemSummary, ItemDetail, ReversePromptData, LibraryStats};
+use crate::models::{ItemDetail, ItemSummary, LibraryStats, ReversePromptData};
 
 const DEFAULT_OPENAI_BASE_URL: &str = "http://127.0.0.1:8317/v1";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5-high";
@@ -116,8 +114,13 @@ fn resolve_openai_chat_variant(model: &str) -> (String, String, Option<String>) 
             } else {
                 None
             }
-        }) {
-        return ((*id).to_string(), (*model).to_string(), Some((*effort).to_string()));
+        })
+    {
+        return (
+            (*id).to_string(),
+            (*model).to_string(),
+            Some((*effort).to_string()),
+        );
     }
 
     if normalized.is_empty() {
@@ -129,7 +132,9 @@ fn resolve_openai_chat_variant(model: &str) -> (String, String, Option<String>) 
 }
 
 fn non_empty_trimmed(value: Option<String>) -> Option<String> {
-    value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn read_pref(handle: &AppHandle, key: &str) -> Option<String> {
@@ -191,13 +196,21 @@ fn normalize_path_for_boundary_check(path: &str) -> Option<std::path::PathBuf> {
 }
 
 fn same_or_descendant_path(candidate: &std::path::Path, root: &std::path::Path) -> bool {
-    let candidate = candidate.canonicalize().unwrap_or_else(|_| candidate.to_path_buf());
+    let candidate = candidate
+        .canonicalize()
+        .unwrap_or_else(|_| candidate.to_path_buf());
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     #[cfg(windows)]
-    let candidate_str = candidate.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    let candidate_str = candidate
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
     #[cfg(windows)]
-    let root_str = root.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    let root_str = root
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
 
     #[cfg(not(windows))]
     let candidate_str = candidate.to_string_lossy().replace('\\', "/");
@@ -216,7 +229,10 @@ fn same_or_descendant_path(candidate: &std::path::Path, root: &std::path::Path) 
     candidate_str.starts_with(&root_with_sep)
 }
 
-fn resolve_openai_config(handle: &AppHandle, model_override: Option<String>) -> ResolvedOpenAiConfig {
+fn resolve_openai_config(
+    handle: &AppHandle,
+    model_override: Option<String>,
+) -> ResolvedOpenAiConfig {
     let base_url = non_empty_trimmed(std::env::var("OPENAI_BASE_URL").ok())
         .or_else(|| non_empty_trimmed(read_pref(handle, "openai_base_url")))
         .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string())
@@ -229,15 +245,16 @@ fn resolve_openai_config(handle: &AppHandle, model_override: Option<String>) -> 
         .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
     let (model_variant, model, reasoning_effort) = resolve_openai_chat_variant(&requested_model);
 
-    let (api_key, api_key_source) = if let Some(key) = non_empty_trimmed(std::env::var("OPENAI_API_KEY").ok()) {
-        (key, "env".to_string())
-    } else if let Some(key) = read_local_openai_key() {
-        (key, "file".to_string())
-    } else if let Some(key) = non_empty_trimmed(read_pref(handle, "openai_api_key")) {
-        (key, "settings".to_string())
-    } else {
-        (String::new(), "missing".to_string())
-    };
+    let (api_key, api_key_source) =
+        if let Some(key) = non_empty_trimmed(std::env::var("OPENAI_API_KEY").ok()) {
+            (key, "env".to_string())
+        } else if let Some(key) = read_local_openai_key() {
+            (key, "file".to_string())
+        } else if let Some(key) = non_empty_trimmed(read_pref(handle, "openai_api_key")) {
+            (key, "settings".to_string())
+        } else {
+            (String::new(), "missing".to_string())
+        };
 
     ResolvedOpenAiConfig {
         base_url,
@@ -250,8 +267,8 @@ fn resolve_openai_config(handle: &AppHandle, model_override: Option<String>) -> 
 }
 
 fn resolve_openai_image_model(model_override: Option<String>) -> ImageModelVariant {
-    let requested_model = non_empty_trimmed(model_override)
-        .unwrap_or_else(|| "gpt-image-2-high".to_string());
+    let requested_model =
+        non_empty_trimmed(model_override).unwrap_or_else(|| "gpt-image-2-high".to_string());
     let (id, model, quality) = OPENAI_IMAGE_MODEL_VARIANTS
         .iter()
         .find(|(id, _, _)| *id == requested_model)
@@ -274,7 +291,10 @@ fn resolve_openai_image_model(model_override: Option<String>) -> ImageModelVaria
 
 fn ensure_openai_key(config: &ResolvedOpenAiConfig) -> Result<(), String> {
     if config.api_key.is_empty() {
-        Err("OpenAI-compatible API Key 未配置。请设置 OPENAI_API_KEY，或确认本机 key 文件存在。".to_string())
+        Err(
+            "OpenAI-compatible API Key 未配置。请设置 OPENAI_API_KEY，或确认本机 key 文件存在。"
+                .to_string(),
+        )
     } else {
         Ok(())
     }
@@ -349,7 +369,7 @@ fn ensure_reference_image_size(size: u64) -> Result<(), String> {
 }
 
 fn ensure_base64_reference_size(base64_content: &str) -> Result<(), String> {
-    let encoded_limit = ((MAX_OPENAI_REFERENCE_IMAGE_BYTES + 2) / 3) * 4 + 4;
+    let encoded_limit = MAX_OPENAI_REFERENCE_IMAGE_BYTES.div_ceil(3) * 4 + 4;
     if base64_content.len() as u64 > encoded_limit {
         return Err(format!(
             "参考图超过 {}，无法上传",
@@ -405,16 +425,15 @@ fn lookup_registered_openai_reference(
 }
 
 fn read_registered_reference_file(path: &Path) -> Result<Vec<u8>, String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("读取参考图信息失败：{}", e))?;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|e| format!("读取参考图信息失败：{}", e))?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() || !file_type.is_file() {
         return Err("参考图必须是普通文件".to_string());
     }
 
     ensure_reference_image_size(metadata.len())?;
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("读取参考图失败：{}", e))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("读取参考图失败：{}", e))?;
     ensure_reference_image_size(bytes.len() as u64)?;
     Ok(bytes)
 }
@@ -437,8 +456,18 @@ fn decode_openai_image_reference(
         let mime_type = detect_openai_reference_image_mime(&bytes)?;
         let file_name = clean_reference_file_name(reference.file_name.clone())
             .or_else(|| clean_reference_file_name(registered.file_name))
-            .or_else(|| path.file_name().and_then(|name| name.to_str()).map(str::to_string))
-            .unwrap_or_else(|| format!("reference-{}.{}", index + 1, image_extension_from_mime(&mime_type)));
+            .or_else(|| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "reference-{}.{}",
+                    index + 1,
+                    image_extension_from_mime(&mime_type)
+                )
+            });
         return Ok((bytes, file_name, mime_type));
     }
 
@@ -455,8 +484,13 @@ fn decode_openai_image_reference(
         .map_err(|e| format!("参考图解码失败：{}", e))?;
     ensure_reference_image_size(bytes.len() as u64)?;
     let mime_type = detect_openai_reference_image_mime(&bytes)?;
-    let file_name = clean_reference_file_name(reference.file_name.clone())
-        .unwrap_or_else(|| format!("reference-{}.{}", index + 1, image_extension_from_mime(&mime_type)));
+    let file_name = clean_reference_file_name(reference.file_name.clone()).unwrap_or_else(|| {
+        format!(
+            "reference-{}.{}",
+            index + 1,
+            image_extension_from_mime(&mime_type)
+        )
+    });
 
     Ok((bytes, file_name, mime_type))
 }
@@ -515,14 +549,23 @@ pub async fn ai_search_library(
     category_id: Option<String>,
     limit: Option<i64>,
 ) -> Result<Vec<ItemSummary>, String> {
-    let limit = limit.unwrap_or(20).min(50).max(1);
-    eprintln!("[ai_search_library] query='{}', tags={:?}, category_id={:?}, limit={}", query, tags, category_id, limit);
+    let limit = limit.unwrap_or(20).clamp(1, 50);
+    eprintln!(
+        "[ai_search_library] query='{}', tags={:?}, category_id={:?}, limit={}",
+        query, tags, category_id, limit
+    );
 
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
-        crud::ai_search_items(&conn, &query, tags.as_deref(), category_id.as_deref(), limit)
-            .map_err(|e| e.to_string())
+        crud::ai_search_items(
+            &conn,
+            &query,
+            tags.as_deref(),
+            category_id.as_deref(),
+            limit,
+        )
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -544,11 +587,13 @@ pub async fn ai_add_tags(
         let tx = conn.transaction().map_err(|e| e.to_string())?;
 
         // 验证素材存在
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM media_files WHERE id = ?)",
-            params![item_id],
-            |r| r.get(0),
-        ).map_err(|e| e.to_string())?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM media_files WHERE id = ?)",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
         if !exists {
             return Err("素材不存在".to_string());
         }
@@ -568,7 +613,10 @@ pub async fn ai_set_category(
     item_id: String,
     category_name: String,
 ) -> Result<(), String> {
-    eprintln!("[ai_set_category] item_id={}, category='{}'", item_id, category_name);
+    eprintln!(
+        "[ai_set_category] item_id={}, category='{}'",
+        item_id, category_name
+    );
 
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
@@ -584,10 +632,7 @@ pub async fn ai_set_category(
 
 /// 获取素材完整详情
 #[tauri::command]
-pub async fn ai_get_item_detail(
-    handle: AppHandle,
-    item_id: String,
-) -> Result<ItemDetail, String> {
+pub async fn ai_get_item_detail(handle: AppHandle, item_id: String) -> Result<ItemDetail, String> {
     eprintln!("[ai_get_item_detail] item_id={}", item_id);
 
     let db = db_path(&handle)?;
@@ -608,7 +653,11 @@ pub async fn ai_update_prompt(
     item_id: String,
     prompt: String,
 ) -> Result<(), String> {
-    eprintln!("[ai_update_prompt] item_id={}, prompt_len={}", item_id, prompt.len());
+    eprintln!(
+        "[ai_update_prompt] item_id={}, prompt_len={}",
+        item_id,
+        prompt.len()
+    );
 
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
@@ -673,9 +722,7 @@ pub async fn ai_reverse_prompt(
 
 /// 获取库统计信息（供 AI 了解全局上下文）
 #[tauri::command]
-pub async fn ai_get_library_stats(
-    handle: AppHandle,
-) -> Result<LibraryStats, String> {
+pub async fn ai_get_library_stats(handle: AppHandle) -> Result<LibraryStats, String> {
     eprintln!("[ai_get_library_stats] Getting library statistics");
 
     let db = db_path(&handle)?;
@@ -697,12 +744,18 @@ pub async fn ai_web_search_save(
     tags: Option<Vec<String>>,
 ) -> Result<i64, String> {
     let url = validate_http_url(&url)?;
-    eprintln!("[ai_web_search_save] title='{}', url='{}', content_len={}", title, url, content.len());
+    eprintln!(
+        "[ai_web_search_save] title='{}', url='{}', content_len={}",
+        title,
+        url,
+        content.len()
+    );
 
     let db = db_path(&handle)?;
     tokio::task::spawn_blocking(move || {
         let mut conn = open_conn(&db).map_err(|e| e.to_string())?;
-        crud::insert_search_bookmark(&mut conn, &title, &url, &content, tags.as_deref()).map_err(|e| e.to_string())
+        crud::insert_search_bookmark(&mut conn, &title, &url, &content, tags.as_deref())
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -739,9 +792,10 @@ pub async fn batch_add_tags(
             };
 
             let tags = match update["tags"].as_array() {
-                Some(t) => t.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>(),
+                Some(t) => t
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>(),
                 None => {
                     log::warn!("[batch_add_tags] Invalid tags for item {}", item_id);
                     fail_count += 1;
@@ -771,8 +825,12 @@ pub async fn batch_add_tags(
     .await
     .map_err(|e| format!("Task join error: {}", e))??;
 
-    log::info!("[batch_add_tags] Completed: success={}, failed={}, total={}",
-    result["success"], result["failed"], result["total"]);
+    log::info!(
+        "[batch_add_tags] Completed: success={}, failed={}, total={}",
+        result["success"],
+        result["failed"],
+        result["total"]
+    );
 
     Ok(result)
 }
@@ -822,7 +880,11 @@ pub async fn openai_list_models(handle: AppHandle) -> Result<OpenAiModelsResult,
         .unwrap_or_default();
     let models = OPENAI_CHAT_MODEL_VARIANTS
         .iter()
-        .filter(|(_, base_model, _)| available_models.iter().any(|available| available == *base_model))
+        .filter(|(_, base_model, _)| {
+            available_models
+                .iter()
+                .any(|available| available == *base_model)
+        })
         .map(|(id, _, _)| (*id).to_string())
         .collect::<Vec<_>>();
     let mut models = models;
@@ -841,7 +903,11 @@ pub async fn openai_list_models(handle: AppHandle) -> Result<OpenAiModelsResult,
 
     let image_models = OPENAI_IMAGE_MODEL_VARIANTS
         .iter()
-        .filter(|(_, base_model, _)| available_models.iter().any(|available| available == *base_model))
+        .filter(|(_, base_model, _)| {
+            available_models
+                .iter()
+                .any(|available| available == *base_model)
+        })
         .map(|(id, _, _)| (*id).to_string())
         .collect::<Vec<_>>();
     let mut image_models = image_models;
@@ -994,7 +1060,8 @@ pub async fn openai_generate_image(
             .text("response_format", "b64_json");
 
         for (index, reference) in references.iter().take(4).enumerate() {
-            let (bytes, file_name, mime_type) = decode_openai_image_reference(&conn, reference, index)?;
+            let (bytes, file_name, mime_type) =
+                decode_openai_image_reference(&conn, reference, index)?;
             let part = reqwest::multipart::Part::bytes(bytes)
                 .file_name(file_name)
                 .mime_str(&mime_type)

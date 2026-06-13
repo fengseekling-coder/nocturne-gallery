@@ -120,8 +120,12 @@ async function migrateFromOldKeys(): Promise<ModelConfig[]> {
 // Component
 // ──────────────────────────────────────────────
 
-export const PreferencesPanel: React.FC<{ onClose: () => void }> = ({ onClose }) => {
+export const PreferencesPanel: React.FC<{
+  onClose: () => void;
+  onLibraryRootChanged?: (root: string) => void;
+}> = ({ onClose, onLibraryRootChanged }) => {
   const showConfirm = useUiStore((s) => s.showConfirm);
+  const showToast = useUiStore((s) => s.showToast);
   const [libraryRoot, setLibraryRoot] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isRescanning, setIsRescanning] = useState(false);
@@ -285,21 +289,35 @@ export const PreferencesPanel: React.FC<{ onClose: () => void }> = ({ onClose })
   const handleChangeLibrary = async () => {
     try {
       const selected = await open({ directory: true, multiple: false, title: '选择新的灵感库根目录' });
-      if (selected && typeof selected === 'string') {
-        if (selected === libraryRoot) return;
-        const confirmed = await showConfirm({
-          title: '切换灵感库',
-          message: '确定要切换到新的灵感库吗？当前列表会重新加载，但不会清空原灵感库的数据。',
-          confirmText: '切换',
-          cancelText: '取消',
-        });
-        if (!confirmed) return;
-        await invoke('set_library_root', { path: selected });
-        setLibraryRoot(selected);
-        await invoke('scan_library');
-      }
+      const selectedPath =
+        typeof selected === 'string'
+          ? selected
+          : Array.isArray(selected) && typeof selected[0] === 'string'
+            ? selected[0]
+            : null;
+      if (!selectedPath) return;
+
+      const normalizedSelected = selectedPath.replace(/\/$/, '');
+      const normalizedCurrent = (libraryRoot ?? '').replace(/\/$/, '');
+      if (normalizedCurrent && normalizedSelected === normalizedCurrent) return;
+
+      const confirmed = await showConfirm({
+        title: '切换灵感库',
+        message:
+          '将把旧路径下的全部素材与库数据（含 .nocturne、灵感库文件夹等）迁移到新路径，并清空旧路径中的数据文件。此操作不可撤销，请确认旧路径已备份或不再需要。',
+        confirmText: '切换',
+        cancelText: '取消',
+      });
+      if (!confirmed) return;
+
+      const resolvedRoot = await invoke<string>('set_library_root', { path: selectedPath });
+      setLibraryRoot(resolvedRoot);
+      onLibraryRootChanged?.(resolvedRoot);
+      await invoke('scan_library');
+      showToast('已切换灵感库');
     } catch (err) {
       console.error('[Preferences] handleChangeLibrary error:', err);
+      showToast('切换灵感库失败');
     }
   };
 
@@ -307,9 +325,18 @@ export const PreferencesPanel: React.FC<{ onClose: () => void }> = ({ onClose })
     if (!libraryRoot) return;
     setIsRescanning(true);
     try {
-      await invoke('rescan_library');
+      const result = await invoke<{ imported_count: number; skipped_count: number; scanned_count: number }>(
+        'rescan_library',
+      );
+      const imported = result?.imported_count ?? 0;
+      if (imported > 0) {
+        showToast(`已从文件夹导入 ${imported} 个新素材`);
+      } else {
+        showToast('文件夹与索引已同步，无新素材');
+      }
     } catch (err) {
       console.error('[Preferences] handleRescanLibrary error:', err);
+      showToast('同步文件夹失败');
     } finally {
       setIsRescanning(false);
     }

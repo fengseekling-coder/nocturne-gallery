@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — LibrarySetup 欢迎页面
+ * Gega Gallery — LibrarySetup 欢迎页面
  *
  * 首次启动时显示，引导用户选择或创建灵感库根目录
  */
@@ -95,6 +95,8 @@ export const LibrarySetup: React.FC<LibrarySetupProps> = ({ onSetup, initialRoot
 
   return (
     <div
+      data-testid="library-setup"
+      className="no-drag"
       style={{
         display: 'flex',
         flexDirection: 'column',

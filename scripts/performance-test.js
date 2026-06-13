@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Nocturne Gallery 性能测试脚本
+ * Gega Gallery 性能测试脚本
  *
  * 使用方法:
  * npm run perf:test
@@ -17,11 +17,16 @@ const CONFIG = {
   viewport: { width: 1920, height: 1080 },
 };
 
-async function runPerformanceTests() {
-  console.log('🚀 启动 Nocturne Gallery 性能测试...\n');
+/**
+ * @param {{ headless?: boolean }} [options]
+ * @returns {Promise<{ generatedAt: string; metrics: Record<string, number | null> } | null>}
+ */
+async function runPerformanceTests(options = {}) {
+  const headless = options.headless ?? CONFIG.headless;
+  console.log('🚀 启动 Gega Gallery 性能测试...\n');
 
   const browser = await chromium.launch({
-    headless: CONFIG.headless,
+    headless,
   });
 
   const context = await browser.newContext({
@@ -29,6 +34,8 @@ async function runPerformanceTests() {
   });
 
   const page = await context.newPage();
+  /** @type {Record<string, number | null>} */
+  const metrics = {};
 
   try {
     // 1. 打开应用
@@ -43,31 +50,40 @@ async function runPerformanceTests() {
     console.log('⏳ 等待数据加载...');
     await page.waitForSelector('[data-card-id]', { timeout: CONFIG.timeout });
     const initialCardCount = await page.$$eval('[data-card-id]', els => els.length);
+    metrics.initialCardCount = initialCardCount;
     console.log(`📊 初始卡片数量: ${initialCardCount}\n`);
 
     // 3. 滚动性能测试
     console.log('🔄 测试滚动性能...');
-    await measureScrollPerformance(page);
+    metrics.scrollFps = await measureScrollPerformance(page);
 
     // 4. 框选性能测试
     console.log('🖱️  测试框选性能...');
-    await measureSelectionPerformance(page);
+    metrics.selectionMs = await measureSelectionPerformance(page);
 
     // 5. 点击选中测试
     console.log('👆 测试点击选中性能...');
-    await measureClickPerformance(page);
+    metrics.clickAvgMs = await measureClickPerformance(page);
 
     // 6. 分组切换测试
     console.log('📁 测试分组切换性能...');
-    await measureGroupSwitchingPerformance(page);
+    metrics.groupSwitchAvgMs = await measureGroupSwitchingPerformance(page);
 
     // 7. 内存使用报告
     console.log('💾 生成内存使用报告...');
-    await generateMemoryReport(page);
+    const mem = await generateMemoryReport(page);
+    metrics.jsHeapUsedMb = mem.jsHeapUsedMb;
+    metrics.jsHeapTotalMb = mem.jsHeapTotalMb;
+    metrics.domNodes = mem.domNodes;
 
     console.log('\n🎉 性能测试完成！');
+    return {
+      generatedAt: new Date().toISOString(),
+      metrics,
+    };
   } catch (error) {
     console.error('❌ 测试失败:', error.message);
+    return null;
   } finally {
     await browser.close();
   }
@@ -200,13 +216,18 @@ async function measureGroupSwitchingPerformance(page) {
 
 async function generateMemoryReport(page) {
   const metrics = await page.metrics();
+  const jsHeapUsedMb = metrics.JSHeapUsedSize / 1024 / 1024;
+  const jsHeapTotalMb = metrics.JSHeapTotalSize / 1024 / 1024;
+  const domNodes = metrics.Nodes ?? null;
 
-  console.log('   JS Heap 使用:', `${(metrics.JSHeapUsedSize / 1024 / 1024).toFixed(2)} MB`);
-  console.log('   JS Heap 总量:', `${(metrics.JSHeapTotalSize / 1024 / 1024).toFixed(2)} MB`);
-  console.log('   DOM 节点数:', metrics.Nodes || 'N/A');
+  console.log('   JS Heap 使用:', `${jsHeapUsedMb.toFixed(2)} MB`);
+  console.log('   JS Heap 总量:', `${jsHeapTotalMb.toFixed(2)} MB`);
+  console.log('   DOM 节点数:', domNodes ?? 'N/A');
   console.log('   布局计数:', metrics.LayoutCount || 'N/A');
   console.log('   样式重计算:', metrics.RecalcStyleCount || 'N/A');
   console.log('');
+
+  return { jsHeapUsedMb, jsHeapTotalMb, domNodes };
 }
 
 // 运行测试

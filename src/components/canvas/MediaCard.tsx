@@ -1,14 +1,23 @@
 /**
- * Nocturne Gallery — MediaCard
+ * Gega Gallery — MediaCard
  *
  * 瀑布流卡片：纯图片/视频预览，无任何文字信息和按钮
  * 只保留：图片/视频/占位图 + 选中态 accent 边框
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getAssetUrl } from '../../lib/thumbnailCache';
-import { pickGridThumbnailPath, pickGridUpgradePath } from '../../lib/gridThumbnail';
+import {
+  listGridThumbnailCandidatePaths,
+  pickGridThumbnailPath,
+  pickGridUpgradePath,
+} from '../../lib/gridThumbnail';
+import {
+  fetchShellPreviewDataUrl,
+  needsDesignPreviewBackfill,
+  runDesignPreviewBackfill,
+} from '../../lib/designPreview';
 import { runWithImageDecodeSlot } from '../../lib/imageDecodeLimiter';
 import { waitForCanvasScrollIdle } from '../../lib/scrollActivityBus';
 import type { MediaFile } from '../../types/media';
@@ -61,6 +70,10 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
   const cardRef = useRef<HTMLDivElement>(null);
   const suppressNextClickRef = useRef(false);
   const nativeDragStartedRef = useRef(false);
+  const lastPointerUpAtRef = useRef(0);
+  const lastPointerUpPosRef = useRef({ x: 0, y: 0 });
+  const DOUBLE_CLICK_DRAG_GUARD_MS = 450;
+  const DOUBLE_CLICK_DRAG_GUARD_PX = 28;
 
   const isSelected = useMediaStore((s) => s.selectedIds.has(file.id));
   const isActive = useMediaStore((s) => s.selectedId === file.id);
@@ -68,18 +81,27 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
   const openDetailPanel = useUiStore((s) => s.openDetailPanel);
   const showMenu = useContextMenuStore((s) => s.showMenu);
   const toggleFileSelection = useMediaStore((s) => s.toggleFileSelection);
+  const applyLayoutDimensions = useMediaStore((s) => s.applyLayoutDimensions);
+  const updateFile = useMediaStore((s) => s.updateFile);
 
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
+  const [shellPreviewSrc, setShellPreviewSrc] = useState<string | null>(null);
+  const designBackfillAttemptedRef = useRef(false);
+  const failedDiskPathsRef = useRef<Set<string>>(new Set());
   const [displayDiskPath, setDisplayDiskPath] = useState<string | null>(() => pickGridThumbnailPath(file));
   const [, setIsInView] = useState(isInitiallyVisible);
   const upgradeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const upgradeGenRef = useRef(0);
 
-  const currentThumbnailSrc = displayDiskPath ? getAssetUrl(displayDiskPath) : '';
+  const currentThumbnailSrc = shellPreviewSrc
+    ?? (displayDiskPath ? getAssetUrl(displayDiskPath) : '');
   const hasStableThumbnail = !!currentThumbnailSrc && !thumbnailFailed;
 
   useEffect(() => {
     setThumbnailFailed(false);
+    setShellPreviewSrc(null);
+    designBackfillAttemptedRef.current = false;
+    failedDiskPathsRef.current = new Set();
     setDisplayDiskPath(pickGridThumbnailPath(file));
     setIsInView(isInitiallyVisible);
     upgradeGenRef.current += 1;
@@ -87,7 +109,101 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
       clearTimeout(upgradeTimerRef.current);
       upgradeTimerRef.current = null;
     }
-  }, [file.id, file.thumbnailMicroPath, file.thumbnailPath, file.thumbnailPreviewPath, isInitiallyVisible]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- pickGridThumbnailPath uses the full file snapshot
+  }, [file.id, file.filepath, file.thumbnailMicroPath, file.thumbnailPath, file.thumbnailPreviewPath, isInitiallyVisible]);
+
+  // Masonry 必须用原图宽高比，不能用 micro 缩略图的 naturalWidth/Height
+  useEffect(() => {
+    if (file.filetype !== 'image') return;
+    const w = file.width;
+    const h = file.height;
+    if (w != null && h != null && w > 0 && h > 0) return;
+
+    let cancelled = false;
+    void invoke<[number, number] | null>('probe_image_dimensions', { id: file.id })
+      .then((dims) => {
+        if (cancelled || !dims || dims.length < 2) return;
+        const [pw, ph] = dims;
+        applyLayoutDimensions(file.id, pw, ph);
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [applyLayoutDimensions, file.filetype, file.id, file.width, file.height]);
+
+  const tryDesignPreviewBackfill = useCallback(() => {
+    if (!needsDesignPreviewBackfill(file)) return;
+    if (designBackfillAttemptedRef.current) return;
+    designBackfillAttemptedRef.current = true;
+    runDesignPreviewBackfill(file, {
+      onShellPreview: (url) => setShellPreviewSrc(url),
+      onDiskPath: (diskPath) => {
+        failedDiskPathsRef.current = new Set();
+        setDisplayDiskPath(diskPath);
+        setThumbnailFailed(false);
+      },
+      onUpdatedFile: (updated) => {
+        updateFile(file.id, {
+          thumbnailMicroPath: updated.thumbnailMicroPath,
+          thumbnailPath: updated.thumbnailPath,
+          thumbnailPreviewPath: updated.thumbnailPreviewPath,
+          thumbhash: updated.thumbhash,
+          width: updated.width,
+          height: updated.height,
+        });
+        failedDiskPathsRef.current = new Set();
+        const next = pickGridThumbnailPath(updated);
+        if (next) {
+          setDisplayDiskPath(next);
+          setThumbnailFailed(false);
+        }
+        void fetchShellPreviewDataUrl(updated.filepath, 512).then((url) => {
+          if (url) {
+            setShellPreviewSrc(url);
+            setThumbnailFailed(false);
+          }
+        });
+      },
+    });
+  }, [file, updateFile]);
+
+  const handleThumbnailError = useCallback(() => {
+    const failed = failedDiskPathsRef.current;
+    if (displayDiskPath) failed.add(displayDiskPath);
+
+    const filepath = file.filepath?.trim();
+    if (
+      filepath
+      && !failed.has(filepath)
+      && (file.filetype === 'image' || file.filetype === 'video')
+    ) {
+      setDisplayDiskPath(filepath);
+      setThumbnailFailed(false);
+      return;
+    }
+
+    if (file.filetype === 'design' || file.filetype === 'document') {
+      const next = listGridThumbnailCandidatePaths(file).find((p) => !failed.has(p));
+      if (next) {
+        setDisplayDiskPath(next);
+        setThumbnailFailed(false);
+        return;
+      }
+      setThumbnailFailed(true);
+      if (!designBackfillAttemptedRef.current) {
+        tryDesignPreviewBackfill();
+      }
+      return;
+    }
+    setThumbnailFailed(true);
+  }, [displayDiskPath, file, tryDesignPreviewBackfill]);
+
+  useEffect(() => {
+    if (!isActive || !needsDesignPreviewBackfill(file)) return;
+    tryDesignPreviewBackfill();
+  }, [isActive, file.id, file.thumbnailMicroPath, file.thumbnailPath, tryDesignPreviewBackfill, file]);
 
   useEffect(() => {
     const el = cardRef.current;
@@ -95,19 +211,27 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
 
     const onVisible = () => {
       setIsInView(true);
-      const base = pickGridThumbnailPath(file);
+      const failed = failedDiskPathsRef.current;
+      const base = pickGridThumbnailPath(file, failed);
       if (base) {
         void runWithImageDecodeSlot(async () => {
-          setDisplayDiskPath((prev) => prev ?? base);
+          setDisplayDiskPath((current) => {
+            if (current && !failed.has(current)) return current;
+            return base;
+          });
+          setThumbnailFailed(false);
         });
+      } else if (needsDesignPreviewBackfill(file)) {
+        tryDesignPreviewBackfill();
       }
 
       if (upgradeTimerRef.current) clearTimeout(upgradeTimerRef.current);
       const gen = ++upgradeGenRef.current;
+      const upgradeBase = base ?? displayDiskPath;
       upgradeTimerRef.current = setTimeout(() => {
         if (gen !== upgradeGenRef.current) return;
-        const upgrade = pickGridUpgradePath(file, base);
-        if (!upgrade) return;
+        const upgrade = pickGridUpgradePath(file, upgradeBase);
+        if (!upgrade || failed.has(upgrade)) return;
         void runWithImageDecodeSlot(async () => {
           await waitForCanvasScrollIdle();
           if (gen !== upgradeGenRef.current) return;
@@ -120,7 +244,9 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
           });
           if (gen !== upgradeGenRef.current) return;
           setDisplayDiskPath(upgrade);
-        }).catch(() => undefined);
+        }).catch(() => {
+          failed.add(upgrade);
+        });
       }, 280);
     };
 
@@ -132,7 +258,7 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
         upgradeTimerRef.current = null;
       }
     };
-  }, [observe, unobserve, file]);
+  }, [observe, unobserve, file, displayDiskPath, tryDesignPreviewBackfill]);
 
 
   const toFileUri = (filePath: string) => (
@@ -241,10 +367,19 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
       });
     };
 
+    function isLikelyDoubleClickGesture(clientX: number, clientY: number): boolean {
+      const elapsed = performance.now() - lastPointerUpAtRef.current;
+      if (elapsed > DOUBLE_CLICK_DRAG_GUARD_MS) return false;
+      const dx = clientX - lastPointerUpPosRef.current.x;
+      const dy = clientY - lastPointerUpPosRef.current.y;
+      return Math.hypot(dx, dy) <= DOUBLE_CLICK_DRAG_GUARD_PX;
+    }
+
     function handlePointerMove(pointerEvent: PointerEvent) {
       const deltaX = pointerEvent.clientX - startX;
       const deltaY = pointerEvent.clientY - startY;
       const distance = Math.hypot(deltaX, deltaY);
+      if (!didDrag && isLikelyDoubleClickGesture(pointerEvent.clientX, pointerEvent.clientY)) return;
       if (!didDrag && distance < POINTER_DRAG_THRESHOLD) return;
       pointerEvent.preventDefault();
       if (!didDrag) {
@@ -259,6 +394,8 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
     }
 
     function handlePointerUp(pointerEvent: PointerEvent) {
+      lastPointerUpAtRef.current = performance.now();
+      lastPointerUpPosRef.current = { x: pointerEvent.clientX, y: pointerEvent.clientY };
       cleanup();
       if (!didDrag || nativeDragStartedRef.current) return;
       pointerEvent.preventDefault();
@@ -313,11 +450,22 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
     showMenu(e.clientX, e.clientY, file.id);
   };
 
-  const handleDoubleClick = React.useCallback(() => {
+  const handleDoubleClick = React.useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    suppressNextClickRef.current = false;
     onDoubleClick?.(file);
   }, [onDoubleClick, file]);
 
   const className = 'media-card no-drag' + (isSelected ? ' is-selected' : '') + (isActive ? ' is-active' : '') + (isDragging ? ' is-dragging' : '');
+
+  const fillStyle: React.CSSProperties = {
+    width: '100%',
+    height: '100%',
+    minHeight: 0,
+    position: 'relative',
+    overflow: 'hidden',
+  };
 
   return (
     <div
@@ -328,11 +476,12 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
       onDragEnd={handleDragEnd}
       onPointerDown={handlePointerDown}
       onClick={handleClick}
+      onDoubleClick={handleDoubleClick}
       onContextMenu={handleContextMenu}
       className={className}
-      style={NO_DRAG_STYLE}
+      style={{ ...NO_DRAG_STYLE, ...fillStyle }}
     >
-      <div style={{ width: '100%', position: 'relative' }}>
+      <div style={{ position: 'absolute', inset: 0 }}>
         {hasStableThumbnail ? (
           <img
             key={currentThumbnailSrc}
@@ -343,11 +492,10 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
             loading={isInitiallyVisible ? 'eager' : 'lazy'}
             style={{ width: '100%', height: '100%', display: 'block', objectFit: 'contain', objectPosition: 'center center', WebkitUserDrag: 'none' } as AppRegionStyle}
             onDragStart={(event) => event.preventDefault()}
-            onError={() => setThumbnailFailed(true)}
-            onDoubleClick={handleDoubleClick}
+            onError={handleThumbnailError}
           />
         ) : (
-          <div style={{ width: '100%', aspectRatio: '4 / 3', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '8px', backgroundColor: 'var(--bg-hover)' }}>
+          <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '8px', backgroundColor: 'var(--bg-hover)' }}>
             <span className="material-symbols-outlined" style={{ fontSize: '40px', color: 'var(--text-muted)' }}>
               {file.filetype === 'video' ? 'movie' : file.filetype === 'design' ? 'brush' : file.filetype === '3d' ? 'view_in_ar' : 'description'}
             </span>

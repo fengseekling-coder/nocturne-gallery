@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — WebCard 网页卡片组件
+ * Gega Gallery — WebCard 网页卡片组件
  *
  * 双击或用默认浏览器打开网页
  * 右键显示上下文菜单

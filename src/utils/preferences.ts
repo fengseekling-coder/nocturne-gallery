@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — Preferences Utility
+ * Gega Gallery — Preferences Utility
  *
  * 封装用户偏好设置的异步读写。
  * 所有持久化数据走 SQLite（通过 Tauri Command）。

@@ -1,5 +1,5 @@
 /**
- * Nocturne Gallery — ContextMenu 类型定义
+ * Gega Gallery — ContextMenu 类型定义
  */
 
 export interface ContextMenuPosition {
