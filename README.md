@@ -1,10 +1,16 @@
 # Gega Gallery
 
-Open-source, local-first desktop workspace for visual references, prompts, and source attachments.
+Source-available, local-first desktop workspace for visual references, prompts, and source attachments.
 
 Gega Gallery is for designers, AI creators, creative workers, and indie makers who collect visual inspiration while moving between folders, browsers, AI tools, and design software. It brings reference images, prompts, grouping, duplicate checks, and external source-file attachments into one private desktop library.
 
-一个开源、本地优先的桌面工作台，把参考图、Prompt 和源文件附件整理在同一个创意素材库里。
+一个源码可见、本地优先的桌面工作台，把参考图、Prompt 和源文件附件整理在同一个创意素材库里。
+
+## ⚠️ 重要声明
+
+本项目已切换为 [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International](./LICENSE)（CC BY-NC-SA 4.0，署名-非商业性使用-相同方式共享）非商业许可协议。仅允许个人免费学习、研究、评估和其他非商业用途。
+
+严禁任何形式的商业牟利、打包售卖、闭源套壳、商业 SaaS、商业交付、付费培训材料、商业产品集成，或用于任何以盈利为目的的商业项目。基于本项目的修改版本如需分发，必须继续以相同或兼容的 BY-NC-SA 协议共享，并保留署名、版权和协议声明。
 
 [Build from source](#build-from-source) · [Roadmap](./ROADMAP.md) · [Contributing](./CONTRIBUTING.md)
 
@@ -106,7 +112,9 @@ Optional screenshots are planned after the first public screenshot pack:
 
 This repository is an early public release of an active desktop application. The core app structure, media workflows, inspector, preview synchronization, attachment panel, import/export drag behavior, and performance tooling are present.
 
-Packaging, release artifacts, automated regression tests, public screenshots, and cross-platform polish are still being improved. There is currently no packaged GitHub Release in this repository, so the project should be built from source.
+**Platform focus (this phase): macOS only.** UI and window chrome follow macOS conventions (traffic-light controls, title-bar drag regions, PingFang-first typography, Quick Look for system previews). Windows and Linux are not in scope for the first public release; backend may still contain dormant cross-platform code for a possible later port.
+
+Packaging, release artifacts, automated regression tests, and public screenshots are still being improved. There is currently no packaged GitHub Release in this repository, so the project should be built from source on **macOS**.
 
 ## Build from Source
 
@@ -177,7 +185,7 @@ tools/               Supporting maintainer tools
 Near-term maintenance work is tracked in [ROADMAP.md](./ROADMAP.md). Current priorities include:
 
 - Public repository readiness.
-- Build and packaging reliability on macOS and Windows.
+- Build and packaging reliability on macOS (`.app` / `.dmg`).
 - Import and duplicate confirmation reliability.
 - Thumbnail diagnostics and media performance.
 - Focused checks for group isolation and preview synchronization.
@@ -192,4 +200,4 @@ Please report security issues privately. See [SECURITY.md](./SECURITY.md).
 
 ## License
 
-This project is released under the [MIT License](./LICENSE).
+This project is released under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](./LICENSE) ([CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)).
