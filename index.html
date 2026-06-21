@@ -5,11 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Gega Gallery</title>
     <script>
-      (function () {
-        var ua = navigator.userAgent.toLowerCase();
-        var p = ua.indexOf('mac') >= 0 ? 'macos' : ua.indexOf('win') >= 0 ? 'windows' : 'linux';
-        document.documentElement.setAttribute('data-platform', p);
-      })();
+      document.documentElement.setAttribute('data-platform', 'macos');
     </script>
   </head>
   <body>

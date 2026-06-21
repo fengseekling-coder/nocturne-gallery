@@ -210,6 +210,15 @@ export const App: React.FC = () => {
     setIsPreferencesOpen(true);
   }, []);
 
+  useEffect(() => {
+    const unlistenMenuPrefs = listen('menu-open-preferences', () => {
+      setIsPreferencesOpen(true);
+    });
+    return () => {
+      void unlistenMenuPrefs.then((fn) => fn());
+    };
+  }, []);
+
   const handleLibraryRootChanged = useCallback(
     (root: string) => {
       resetStartupBootstrapCache();

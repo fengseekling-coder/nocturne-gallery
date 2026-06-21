@@ -13,8 +13,7 @@ import { useMediaStore } from '../../stores/mediaStore';
 import { useUiStore } from '../../stores/uiStore';
 import { TagBadge } from '../common/TagBadge';
 import { Icon } from '../common/Icon';
-import { WindowControls } from '../common/WindowControls';
-import { detectUiPlatform } from '../../lib/platform';
+
 import { getPreference, setPreference } from '../../utils/preferences';
 import { ModelCombobox } from './ModelCombobox';
 import { AttachmentPanel } from './AttachmentPanel';
@@ -269,7 +268,7 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({ inspectorWidth, setIns
   // 从 uiStore 获取 AI 模式状态
   const isAIMode = useUiStore((s) => s.isAIMode);
   const toggleAIMode = useUiStore((s) => s.toggleAIMode);
-  const isMacUi = detectUiPlatform() === 'macos';
+
 
   const inspectorMediaId = selectedId ?? canvasAttachmentPreview?.ownerMediaId ?? null;
   const detail = useMediaStore((s) => (inspectorMediaId ? s.detailCache[inspectorMediaId] ?? null : null));
@@ -1678,12 +1677,6 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({ inspectorWidth, setIns
           </button>
         </div>
 
-        {/* Windows/Linux：右侧窗口按钮；macOS 仅侧栏左上角一套红绿灯 */}
-        {!isMacUi && (
-          <div className="no-drag" style={{ position: 'relative', width: '108px', height: '48px', flexShrink: 0 }}>
-            <WindowControls topOffset={0} rightOffset={0} />
-          </div>
-        )}
       </div>
 
       {/* 拖拽条 */}
@@ -1934,7 +1927,7 @@ export const DetailPanel: React.FC<DetailPanelProps> = ({ inspectorWidth, setIns
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '14px', borderRadius: '16px', background: 'var(--bg-card)', boxShadow: 'inset 0 0 0 1px var(--border)' }}>
                   {/* 提示词文本框 */}
-                  <SectionLabel style={{ marginBottom: '2px' }}>Prompt</SectionLabel>
+                  <SectionLabel style={{ marginBottom: '2px' }}>提示词</SectionLabel>
                   <textarea
                     ref={promptTextareaRef}
                     value={promptDraft}

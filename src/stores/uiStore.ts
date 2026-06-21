@@ -8,6 +8,7 @@
 import { create } from 'zustand';
 import type { ToastState } from '../types/ui';
 import { getPreference, setPreference } from '../utils/preferences';
+import { notifyGridZoomActivity } from '../lib/gridZoomBus';
 
 export interface CanvasAttachmentPreviewItem {
   id: string;
@@ -228,8 +229,10 @@ export const useUiStore = create<UiState & UiActions>()((set, get) => {
     // ----------------------------------------------------------------
     setColumnCount: async (count) => {
       const clampedCount = Math.max(2, Math.min(6, count));
-      set({ columnCount: clampedCount }); // 立即更新 UI
-      setPreference('columnCount', clampedCount.toString()); // 异步持久化，不阻塞
+      if (clampedCount === get().columnCount) return;
+      notifyGridZoomActivity();
+      set({ columnCount: clampedCount });
+      setPreference('columnCount', clampedCount.toString());
     },
 
     // ----------------------------------------------------------------

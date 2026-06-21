@@ -97,6 +97,31 @@ pub fn has_modern_webp_tiers(
     false
 }
 
+/// sidecar 可能用「完整文件名」或「无扩展名 stem」（旧扫描/视频管线）命名。
+fn sidecar_name_bases(source_file: &Path, filename_hint: &str) -> Vec<String> {
+    let mut bases: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        let t = s.trim();
+        if !t.is_empty() && !bases.iter().any(|b| b == t) {
+            bases.push(t.to_string());
+        }
+    };
+    if let Some(disk) = source_file.file_name().and_then(|n| n.to_str()) {
+        push(disk);
+        if let Some(stem) = Path::new(disk).file_stem().and_then(|s| s.to_str()) {
+            push(stem);
+        }
+    }
+    push(filename_hint);
+    if let Some(stem) = Path::new(filename_hint)
+        .file_stem()
+        .and_then(|s| s.to_str())
+    {
+        push(stem);
+    }
+    bases
+}
+
 /// 从源文件同目录 `.nocturne_meta` 发现已生成的 WebP/JPEG 缩略图（绝对路径）。
 pub fn discover_existing_sidecar_tiers(
     source_file: &Path,
@@ -108,22 +133,36 @@ pub fn discover_existing_sidecar_tiers(
         return (None, None, None);
     }
 
-    let micro = meta_dir.join(format!("{}_micro.webp", filename));
-    let thumb_webp = meta_dir.join(format!("{}_thumb.webp", filename));
-    let thumb_jpg = meta_dir.join(format!("{}_thumb.jpg", filename));
-    let preview = meta_dir.join(format!("{}_preview.webp", filename));
+    let mut micro_p: Option<String> = None;
+    let mut std_p: Option<String> = None;
+    let mut prev_p: Option<String> = None;
 
-    let micro_p = micro.is_file().then(|| micro.to_string_lossy().to_string());
-    let std_p = if thumb_webp.is_file() {
-        Some(thumb_webp.to_string_lossy().to_string())
-    } else if thumb_jpg.is_file() {
-        Some(thumb_jpg.to_string_lossy().to_string())
-    } else {
-        None
-    };
-    let prev_p = preview
-        .is_file()
-        .then(|| preview.to_string_lossy().to_string());
+    for base in sidecar_name_bases(source_file, filename) {
+        if micro_p.is_none() {
+            let micro = meta_dir.join(format!("{}_micro.webp", base));
+            if micro.is_file() {
+                micro_p = Some(micro.to_string_lossy().to_string());
+            }
+        }
+        if std_p.is_none() {
+            let thumb_webp = meta_dir.join(format!("{}_thumb.webp", base));
+            let thumb_jpg = meta_dir.join(format!("{}_thumb.jpg", base));
+            if thumb_webp.is_file() {
+                std_p = Some(thumb_webp.to_string_lossy().to_string());
+            } else if thumb_jpg.is_file() {
+                std_p = Some(thumb_jpg.to_string_lossy().to_string());
+            }
+        }
+        if prev_p.is_none() {
+            let preview = meta_dir.join(format!("{}_preview.webp", base));
+            if preview.is_file() {
+                prev_p = Some(preview.to_string_lossy().to_string());
+            }
+        }
+        if micro_p.is_some() && std_p.is_some() && prev_p.is_some() {
+            break;
+        }
+    }
 
     (micro_p, std_p, prev_p)
 }

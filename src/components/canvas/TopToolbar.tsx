@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useUiStore } from '../../stores/uiStore';
 import { Icon } from '../common/Icon';
+import { ColumnZoomSlider } from './ColumnZoomSlider';
+
 
 interface AppRegionStyle extends React.CSSProperties {
   WebkitAppRegion?: 'drag' | 'no-drag';
@@ -187,12 +189,11 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   const setColumnCount = useUiStore((s) => s.setColumnCount);
 
   const [isSearchFocused, setIsSearchFocused] = useState(false);
-  const [sliderValue, setSliderValue] = useState(() => 8 - columnCount);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    setSliderValue(8 - columnCount);
-  }, [columnCount]);
+  const setToolbarColumnCount = (nextCount: number) => {
+    void setColumnCount(Math.max(2, Math.min(6, nextCount)));
+  };
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -222,10 +223,19 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
     boxShadow: isSearchFocused ? '0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent)' : 'inset 0 0 0 1px var(--border)',
   };
 
-  const setToolbarColumnCount = (nextCount: number) => {
-    const clampedCount = Math.max(2, Math.min(6, nextCount));
-    setSliderValue(8 - clampedCount);
-    void setColumnCount(clampedCount);
+  const zoomStepButtonStyle: AppRegionStyle = {
+    width: '28px',
+    height: '28px',
+    display: 'grid',
+    placeItems: 'center',
+    borderRadius: '999px',
+    border: 'none',
+    padding: 0,
+    background: 'transparent',
+    color: 'var(--text-muted)',
+    cursor: 'pointer',
+    transition: 'background .12s ease, color .12s ease, transform .08s ease',
+    WebkitAppRegion: 'no-drag',
   };
 
   return (
@@ -251,7 +261,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
           className="no-drag"
           style={searchInputStyle}
         />
-        <span style={searchShortcutStyle}>Ctrl K</span>
+        <span style={searchShortcutStyle}>⌘K</span>
       </div>
 
       {shouldShowTabs && (
@@ -343,35 +353,65 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
       )}
 
       {showZoomControls && (
-        <div className="no-drag" style={{ ...pillStyle, gap: '8px', padding: '0 8px' }}>
-          <Icon
-            name="grid_on"
-            size={16}
+        <div
+          className="no-drag zoom-controls-pill"
+          style={{ ...pillStyle, gap: '4px', padding: '0 6px' }}
+          title="调整网格密度"
+        >
+          <button
+            type="button"
             className="no-drag"
-            style={{ color: 'var(--text-muted)', cursor: 'pointer', userSelect: 'none' }}
+            title="缩小（更多列）"
+            aria-label="缩小网格"
+            disabled={columnCount >= 6}
+            style={{
+              ...zoomStepButtonStyle,
+              opacity: columnCount >= 6 ? 0.35 : 1,
+              cursor: columnCount >= 6 ? 'default' : 'pointer',
+            }}
             onClick={() => setToolbarColumnCount(columnCount + 1)}
-          />
+            onMouseEnter={(event) => {
+              if (columnCount >= 6) return;
+              event.currentTarget.style.background = 'var(--bg-hover)';
+              event.currentTarget.style.color = 'var(--text-primary)';
+            }}
+            onMouseLeave={(event) => {
+              event.currentTarget.style.background = 'transparent';
+              event.currentTarget.style.color = 'var(--text-muted)';
+            }}
+          >
+            <Icon name="remove" size={18} />
+          </button>
           <div style={sliderContainerStyle}>
-            <input
-              type="range"
-              min={2}
-              max={6}
-              value={sliderValue}
-              onChange={(event) => {
-                const value = Number(event.target.value);
-                setSliderValue(value);
-                void setColumnCount(8 - value);
-              }}
-              className="zoom-slider no-drag"
+            <ColumnZoomSlider
+              columnCount={columnCount}
+              onCommit={setToolbarColumnCount}
             />
           </div>
-          <Icon
-            name="window"
-            size={16}
+          <button
+            type="button"
             className="no-drag"
-            style={{ color: 'var(--text-muted)', cursor: 'pointer', userSelect: 'none' }}
+            title="放大（更少列）"
+            aria-label="放大网格"
+            disabled={columnCount <= 2}
+            style={{
+              ...zoomStepButtonStyle,
+              opacity: columnCount <= 2 ? 0.35 : 1,
+              cursor: columnCount <= 2 ? 'default' : 'pointer',
+            }}
             onClick={() => setToolbarColumnCount(columnCount - 1)}
-          />
+            onMouseEnter={(event) => {
+              if (columnCount <= 2) return;
+              event.currentTarget.style.background = 'var(--bg-hover)';
+              event.currentTarget.style.color = 'var(--text-primary)';
+            }}
+            onMouseLeave={(event) => {
+              event.currentTarget.style.background = 'transparent';
+              event.currentTarget.style.color = 'var(--text-muted)';
+            }}
+          >
+            <Icon name="add" size={18} />
+          </button>
         </div>
       )}
     </div>

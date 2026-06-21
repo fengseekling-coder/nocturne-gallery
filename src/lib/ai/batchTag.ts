@@ -75,7 +75,7 @@ async function analyzeImage(fileName: string, base64: string, signal?: AbortSign
     return data.content.split(/[,，]/).map((t: string) => t.trim()).filter(Boolean);
   } else if (providerType === 'claude') {
     const apiKey = await getPreference('claude_api_key', '');
-    if (!apiKey) throw new Error('Claude API Key 未配置');
+    if (!apiKey) throw new Error('Claude 接口密钥未配置');
     const model = await getPreference('claude_model', 'claude-sonnet-4-5');
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -104,7 +104,7 @@ async function analyzeImage(fileName: string, base64: string, signal?: AbortSign
     return text.split(/[,，]/).map((t: string) => t.trim()).filter(Boolean);
   } else if (providerType === 'bailian') {
     const apiKey = await getPreference('bailian_api_key', '');
-    if (!apiKey) throw new Error('百炼 API Key 未配置');
+    if (!apiKey) throw new Error('百炼接口密钥未配置');
     const model = await getPreference('bailian_model', 'qwen-vl-plus');
     const response = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
       method: 'POST',

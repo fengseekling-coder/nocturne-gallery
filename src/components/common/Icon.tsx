@@ -59,6 +59,7 @@ const ICON_PATHS = {
   window: () => <g><rect x="4" y="5" width="16" height="14" rx="1" /><path d="M4 9h16" /></g>,
 
   add: () => <g><path d="M12 5v14" /><path d="M5 12h14" /></g>,
+  remove: () => <path d="M5 12h14" />,
   add_comment: () => <g><path d="M5 5h14v10H9l-4 4V5z" /><path d="M12 8v4" /><path d="M10 10h4" /></g>,
   history: () => <g><path d="M4 12a8 8 0 1 0 2.3-5.7" /><path d="M4 5v5h5" /><path d="M12 8v5l3 2" /></g>,
   close: () => <g><path d="M6 6l12 12" /><path d="M18 6L6 18" /></g>,
@@ -195,21 +196,4 @@ export const Icon: React.FC<IconProps> = ({
   );
 };
 
-export const WinMin: React.FC = () => (
-  <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-    <line x1="0" y1="5" x2="10" y2="5" stroke="currentColor" strokeWidth="1" />
-  </svg>
-);
 
-export const WinMax: React.FC = () => (
-  <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-    <rect x="0.5" y="0.5" width="9" height="9" stroke="currentColor" fill="none" strokeWidth="1" />
-  </svg>
-);
-
-export const WinClose: React.FC = () => (
-  <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-    <line x1="0" y1="0" x2="10" y2="10" stroke="currentColor" strokeWidth="1" />
-    <line x1="10" y1="0" x2="0" y2="10" stroke="currentColor" strokeWidth="1" />
-  </svg>
-);

@@ -44,7 +44,7 @@ export const webTools: Tool[] = [
       const apiKey = await invoke<string | null>('get_preference', { key: 'tavily_api_key' });
 
       if (!apiKey) {
-        return { error: '未配置 Tavily API Key，请在设置中添加' };
+        return { error: '未配置 Tavily 接口密钥，请在设置中添加' };
       }
 
       const response = await fetch('https://api.tavily.com/search', {

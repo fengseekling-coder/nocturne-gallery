@@ -15,8 +15,12 @@ import { Icon } from '../common/Icon';
 import { ModelCombobox } from './ModelCombobox';
 import type { MediaAttachment, MediaDetail } from '../../types/media';
 import { normalizeTransferredFilePath, pathToFileUri } from '../../utils/filePath';
-import { pickInspectorThumbnailPath } from '../../lib/gridThumbnail';
+import { listGridThumbnailCandidatePaths, pickInspectorThumbnailPath } from '../../lib/gridThumbnail';
 import { resolveDisplaySrc } from '../../lib/loadFullResolution';
+import {
+  needsDesignPreviewBackfill,
+  runDesignPreviewBackfill,
+} from '../../lib/designPreview';
 
 // ----------------------------------------------------------------
 // Types
@@ -151,7 +155,7 @@ const AttachmentNotice: React.FC = React.memo(() => (
   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '14px', borderRadius: '16px', background: 'color-mix(in srgb, var(--bg-card) 84%, transparent)', boxShadow: 'inset 0 0 0 1px var(--border)' }}>
     <SectionLabel style={{ marginBottom: '2px' }}>附件说明</SectionLabel>
     <div style={{ padding: '12px', borderRadius: '12px', background: 'var(--bg-surface)', boxShadow: 'inset 0 0 0 1px var(--border)', fontSize: '12px', lineHeight: 1.7, color: 'var(--text-secondary)' }}>
-      当前右侧面板显示的是附件文件信息。<br />附件是外部引用，不继承素材本体的标签、Prompt 和 AI 元数据。
+      当前右侧面板显示的是附件文件信息。<br />附件是外部引用，不继承素材本体的标签、提示词和 AI 元数据。
     </div>
   </div>
 ));
@@ -259,6 +263,7 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
   const addAttachments = useMediaStore((s) => s.addAttachments);
   const appendTagToCachedItems = useMediaStore((s) => s.appendTagToCachedItems);
   const fetchFiles = useMediaStore((s) => s.fetchFiles);
+  const updateFile = useMediaStore((s) => s.updateFile);
   const deselectAll = useMediaStore((s) => s.deselectAll);
   const openCanvasAttachmentPreview = useUiStore((s) => s.openCanvasAttachmentPreview);
   const canvasAttachmentPreview = useUiStore((s) => s.canvasAttachmentPreview);
@@ -278,6 +283,9 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
   const [previewAttachmentId, setPreviewAttachmentId] = useState<string | null>(null);
   const [inspectorPreviewDiskPath, setInspectorPreviewDiskPath] = useState<string | null>(null);
   const [inspectorPreviewFailed, setInspectorPreviewFailed] = useState(false);
+  const [inspectorShellPreviewSrc, setInspectorShellPreviewSrc] = useState<string | null>(null);
+  const inspectorPreviewFailedPathsRef = useRef<Set<string>>(new Set());
+  const inspectorDesignBackfillAttemptedRef = useRef(false);
   const [selectedAttachmentId, setSelectedAttachmentId] = useState<string | null>(null);
   const [isAttachmentDragOver, setIsAttachmentDragOver] = useState(false);
   const [attachmentPreviewMap, setAttachmentPreviewMap] = useState<Record<string, string>>({});
@@ -597,8 +605,47 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
       : (attachmentPreviewMap[inspectorAttachment.id] ?? null);
   }, [attachmentPreviewMap, inspectorAttachment, isDirectAttachmentPreview]);
 
+  const tryInspectorDesignPreview = useCallback(() => {
+    if (!detail || inspectorAttachment) return;
+    if (!needsDesignPreviewBackfill(detail.file)) return;
+    if (inspectorDesignBackfillAttemptedRef.current) return;
+    inspectorDesignBackfillAttemptedRef.current = true;
+    runDesignPreviewBackfill(detail.file, {
+      onShellPreview: (url) => {
+        setInspectorShellPreviewSrc(url);
+        setInspectorPreviewFailed(false);
+      },
+      onDiskPath: (diskPath) => {
+        inspectorPreviewFailedPathsRef.current = new Set();
+        setInspectorPreviewDiskPath(diskPath);
+        setInspectorPreviewFailed(false);
+      },
+      onUpdatedFile: (updated) => {
+        updateFile(detail.file.id, {
+          thumbnailMicroPath: updated.thumbnailMicroPath,
+          thumbnailPath: updated.thumbnailPath,
+          thumbnailPreviewPath: updated.thumbnailPreviewPath,
+          thumbhash: updated.thumbhash,
+          width: updated.width,
+          height: updated.height,
+          filepath: updated.filepath,
+        });
+        inspectorPreviewFailedPathsRef.current = new Set();
+        const next = pickInspectorThumbnailPath(updated);
+        if (next) {
+          setInspectorPreviewDiskPath(next);
+          setInspectorPreviewFailed(false);
+        }
+      },
+    });
+  }, [detail, inspectorAttachment, updateFile]);
+
   useEffect(() => {
+    inspectorDesignBackfillAttemptedRef.current = false;
+    inspectorPreviewFailedPathsRef.current = new Set();
+    setInspectorShellPreviewSrc(null);
     setInspectorPreviewFailed(false);
+
     if (inspectorAttachment) {
       setInspectorPreviewDiskPath(null);
       return;
@@ -620,6 +667,9 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
       return;
     }
     setInspectorPreviewDiskPath(null);
+    if (needsDesignPreviewBackfill(detail.file)) {
+      tryInspectorDesignPreview();
+    }
   }, [
     detail,
     inspectorAttachment,
@@ -630,22 +680,54 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
     detail?.file.thumbnailPreviewPath,
     detail?.file.fileSize,
     detail?.file.filename,
+    detail?.file.filetype,
+    tryInspectorDesignPreview,
+  ]);
+
+  useEffect(() => {
+    if (!detail || inspectorAttachment || inspectorShellPreviewSrc) return;
+    const next = pickInspectorThumbnailPath(detail.file);
+    if (!next) return;
+    setInspectorPreviewDiskPath((current) => (current === next ? current : next));
+    setInspectorPreviewFailed(false);
+  }, [
+    detail,
+    inspectorAttachment,
+    inspectorShellPreviewSrc,
+    detail?.file.thumbnailMicroPath,
+    detail?.file.thumbnailPath,
+    detail?.file.thumbnailPreviewPath,
   ]);
 
   const handleInspectorPreviewError = useCallback(() => {
     if (!detail || inspectorAttachment) return;
+    const failed = inspectorPreviewFailedPathsRef.current;
+    if (inspectorPreviewDiskPath) failed.add(inspectorPreviewDiskPath);
+
     const filepath = detail.file.filepath?.trim();
     if (
       filepath
-      && inspectorPreviewDiskPath !== filepath
+      && !failed.has(filepath)
       && (detail.file.filetype === 'image' || detail.file.filetype === 'video')
     ) {
       setInspectorPreviewDiskPath(filepath);
       setInspectorPreviewFailed(false);
       return;
     }
+
+    if (detail.file.filetype === 'design' || detail.file.filetype === 'document') {
+      const next = listGridThumbnailCandidatePaths(detail.file).find((p) => !failed.has(p));
+      if (next) {
+        setInspectorPreviewDiskPath(next);
+        setInspectorPreviewFailed(false);
+        return;
+      }
+      setInspectorPreviewFailed(true);
+      tryInspectorDesignPreview();
+      return;
+    }
     setInspectorPreviewFailed(true);
-  }, [detail, inspectorAttachment, inspectorPreviewDiskPath]);
+  }, [detail, inspectorAttachment, inspectorPreviewDiskPath, tryInspectorDesignPreview]);
 
   const activePreviewAttachment = useMemo(
     () => detail?.attachments.find((attachment) => attachment.id === previewAttachmentId) ?? null,
@@ -682,9 +764,10 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
   const inspectorDisplayName = inspectorAttachment?.filename ?? detail?.file.filename ?? '';
   const inspectorDisplayPreviewSrc = inspectorAttachment
     ? inspectorAttachmentPreviewSrc
-    : (inspectorPreviewDiskPath && !inspectorPreviewFailed
-      ? resolveDisplaySrc(inspectorPreviewDiskPath)
-      : null);
+    : (inspectorShellPreviewSrc
+      ?? (inspectorPreviewDiskPath && !inspectorPreviewFailed
+        ? resolveDisplaySrc(inspectorPreviewDiskPath)
+        : null));
   const inspectorDisplayPath = inspectorAttachment?.filepath ?? detail?.file.filepath ?? '';
   const inspectorDisplayFormat = inspectorDisplayName.includes('.')
     ? inspectorDisplayName.split('.').pop()!.toUpperCase()
@@ -977,7 +1060,7 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
       {inspectorAttachment ? (
         <AttachmentNotice />
       ) : !hasSingleSelection ? (
-        <ModeHintCard title="单张模式" body="当前为浏览预览状态，已隐藏标签和 Prompt 编辑器，以减少翻页时的渲染负担。" />
+        <ModeHintCard title="单张模式" body="当前为浏览预览状态，已隐藏标签和提示词编辑器，以减少翻页时的渲染负担。" />
       ) : (
         <>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center' }}>
@@ -998,7 +1081,7 @@ export const PropertyPanel: React.FC<PropertyPanelProps> = React.memo(({
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '14px', borderRadius: '16px', background: 'color-mix(in srgb, var(--bg-card) 84%, transparent)', boxShadow: 'inset 0 0 0 1px var(--border)' }}>
-            <SectionLabel style={{ marginBottom: '2px' }}>Prompt</SectionLabel>
+            <SectionLabel style={{ marginBottom: '2px' }}>提示词</SectionLabel>
             <textarea ref={promptTextareaRef} value={promptDraft} onChange={(e) => setPromptDraft(e.target.value)}
               onKeyDown={handlePromptKeyDown} onWheel={handlePromptWheel} placeholder="在此记录提示词..." wrap="soft" spellCheck={false}
               style={{ width: '100%', padding: '12px', backgroundColor: 'var(--bg-surface)', borderRadius: 'var(--radius-default)', boxShadow: 'inset 0 0 0 1px var(--border)', border: 'none', fontFamily: 'var(--font-family)', fontSize: '12px', color: 'var(--text-primary)', resize: 'none', outline: 'none', lineHeight: 1.6, display: 'block', boxSizing: 'border-box', overflowX: 'hidden', overflowY: isPromptOverflow ? 'auto' : 'hidden', minHeight: `${COLLAPSED_PROMPT_HEIGHT}px`, transition: 'height 0.2s ease', whiteSpace: 'pre-wrap', tabSize: 2 }}

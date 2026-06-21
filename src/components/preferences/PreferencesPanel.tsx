@@ -53,8 +53,8 @@ const PROVIDER_META: Record<
   string,
   { letter: string; label: string; needsKey: boolean; needsUrl: boolean }
 > = {
-  claude:  { letter: 'C',  label: 'Claude',   needsKey: true,  needsUrl: false },
-  openai:  { letter: 'AI', label: 'OpenAI-compatible', needsKey: true, needsUrl: true },
+  claude:  { letter: 'C',  label: 'Claude（Anthropic）', needsKey: true,  needsUrl: false },
+  openai:  { letter: 'AI', label: 'OpenAI 兼容接口', needsKey: true, needsUrl: true },
   bailian: { letter: '炼', label: '百炼',     needsKey: true,  needsUrl: false },
   tavily:  { letter: '搜', label: '联网搜索', needsKey: true,  needsUrl: false },
 };
@@ -90,7 +90,7 @@ async function migrateFromOldKeys(): Promise<ModelConfig[]> {
     list.push({
       id: crypto.randomUUID(),
       provider: 'claude',
-      displayName: 'Claude',
+      displayName: 'Claude（Anthropic）',
       model: 'claude-sonnet-4-6',
       apiKey: claude,
     });
@@ -210,7 +210,7 @@ export const PreferencesPanel: React.FC<{
             loadedList = [...loadedList, {
               id: crypto.randomUUID(),
               provider: 'openai',
-              displayName: 'OpenAI-compatible',
+              displayName: 'OpenAI 兼容接口',
               model: openAiConfig.model || 'gpt-5.5-high',
               url: openAiConfig.baseUrl || 'http://127.0.0.1:8317/v1',
             }];
@@ -564,7 +564,7 @@ export const PreferencesPanel: React.FC<{
                     }}
                     style={{ ...inputStyle, appearance: 'none', WebkitAppearance: 'none' }}
                   >
-                    <option value="openai">OpenAI-compatible（本机）</option>
+                    <option value="openai">OpenAI 兼容接口（本机）</option>
                     <option value="claude">Claude（Anthropic）</option>
                     <option value="bailian">百炼（阿里云）</option>
                     <option value="tavily">联网搜索（Tavily）</option>
@@ -600,7 +600,7 @@ export const PreferencesPanel: React.FC<{
                 {PROVIDER_META[addForm.provider]?.needsKey && (
                   <div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-                      <label style={{ ...labelStyle, marginBottom: 0 }}>API Key</label>
+                      <label style={{ ...labelStyle, marginBottom: 0 }}>接口密钥</label>
                       {addForm.provider === 'tavily' && (
                         <a href="https://tavily.com" target="_blank" rel="noreferrer" style={{ fontSize: '11px', color: 'var(--accent)', textDecoration: 'none', fontFamily: 'var(--font-family)' }}>免费申请 →</a>
                       )}

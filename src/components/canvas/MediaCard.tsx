@@ -11,15 +11,16 @@ import { getAssetUrl } from '../../lib/thumbnailCache';
 import {
   listGridThumbnailCandidatePaths,
   pickGridThumbnailPath,
+  pickGridThumbnailPathForCellWidth,
   pickGridUpgradePath,
 } from '../../lib/gridThumbnail';
 import {
-  fetchShellPreviewDataUrl,
   needsDesignPreviewBackfill,
   runDesignPreviewBackfill,
 } from '../../lib/designPreview';
 import { runWithImageDecodeSlot } from '../../lib/imageDecodeLimiter';
 import { waitForCanvasScrollIdle } from '../../lib/scrollActivityBus';
+import { getGridZoomSettling, waitForGridZoomSettle } from '../../lib/gridZoomBus';
 import type { MediaFile } from '../../types/media';
 import { useMediaStore } from '../../stores/mediaStore';
 import { useUiStore } from '../../stores/uiStore';
@@ -57,6 +58,8 @@ const NO_DRAG_STYLE: AppRegionStyle = { WebkitAppRegion: 'no-drag' };
 
 interface MediaCardProps {
   file: MediaFile;
+  /** 当前 Masonry 单元格 CSS 宽度，用于按格选缩略图档位 */
+  cellLayoutWidth?: number;
   isInitiallyVisible?: boolean;
   onDragStart?: () => void;
   onDragEnd?: () => void;
@@ -65,7 +68,7 @@ interface MediaCardProps {
   unobserve: (el: Element) => void;
 }
 
-export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible = false, onDragStart, onDragEnd, onDoubleClick, observe, unobserve }) => {
+export const MediaCard = React.memo<MediaCardProps>(({ file, cellLayoutWidth = 0, isInitiallyVisible = false, onDragStart, onDragEnd, onDoubleClick, observe, unobserve }) => {
   const [isDragging, setIsDragging] = useState(false);
   const cardRef = useRef<HTMLDivElement>(null);
   const suppressNextClickRef = useRef(false);
@@ -88,6 +91,13 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
   const [shellPreviewSrc, setShellPreviewSrc] = useState<string | null>(null);
   const designBackfillAttemptedRef = useRef(false);
   const failedDiskPathsRef = useRef<Set<string>>(new Set());
+  const pickPathForLayout = useCallback((exclude?: ReadonlySet<string>) => {
+    if (cellLayoutWidth > 0) {
+      return pickGridThumbnailPathForCellWidth(file, cellLayoutWidth, exclude);
+    }
+    return pickGridThumbnailPath(file, exclude);
+  }, [cellLayoutWidth, file]);
+
   const [displayDiskPath, setDisplayDiskPath] = useState<string | null>(() => pickGridThumbnailPath(file));
   const [, setIsInView] = useState(isInitiallyVisible);
   const upgradeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -110,9 +120,31 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
       upgradeTimerRef.current = null;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- pickGridThumbnailPath uses the full file snapshot
-  }, [file.id, file.filepath, file.thumbnailMicroPath, file.thumbnailPath, file.thumbnailPreviewPath, isInitiallyVisible]);
+  }, [
+    file.id,
+    file.filepath,
+    file.thumbnailMicroPath,
+    file.thumbnailPath,
+    file.thumbnailPreviewPath,
+    isInitiallyVisible,
+  ]);
 
-  // Masonry 必须用原图宽高比，不能用 micro 缩略图的 naturalWidth/Height
+  // 后台 design backfill 写回 DB 后 store 更新路径，允许再次尝试磁盘图（不必一直停在 shell/data URL）
+  useEffect(() => {
+    if (shellPreviewSrc) return;
+    const next = pickGridThumbnailPath(file);
+    if (!next) return;
+    setDisplayDiskPath((current) => (current === next ? current : next));
+    setThumbnailFailed(false);
+  }, [
+    file.thumbnailMicroPath,
+    file.thumbnailPath,
+    file.thumbnailPreviewPath,
+    shellPreviewSrc,
+    file,
+  ]);
+
+  // Masonry 必须用原图宽高比；网格缩放稳定期内不探测，避免连续整页重排
   useEffect(() => {
     if (file.filetype !== 'image') return;
     const w = file.width;
@@ -120,18 +152,35 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
     if (w != null && h != null && w > 0 && h > 0) return;
 
     let cancelled = false;
-    void invoke<[number, number] | null>('probe_image_dimensions', { id: file.id })
-      .then((dims) => {
-        if (cancelled || !dims || dims.length < 2) return;
-        const [pw, ph] = dims;
-        applyLayoutDimensions(file.id, pw, ph);
-      })
-      .catch(() => {});
+    void (async () => {
+      await waitForGridZoomSettle();
+      if (cancelled || getGridZoomSettling()) return;
+      const dims = await invoke<[number, number] | null>('probe_image_dimensions', { id: file.id }).catch(() => null);
+      if (cancelled || !dims || dims.length < 2) return;
+      const [pw, ph] = dims;
+      applyLayoutDimensions(file.id, pw, ph);
+    })();
 
     return () => {
       cancelled = true;
     };
   }, [applyLayoutDimensions, file.filetype, file.id, file.width, file.height]);
+
+  useEffect(() => {
+    if (cellLayoutWidth <= 0) return;
+    const next = pickPathForLayout(failedDiskPathsRef.current);
+    if (!next) return;
+    setDisplayDiskPath((current) => {
+      if (current === next) return current;
+      return next;
+    });
+    setThumbnailFailed(false);
+    upgradeGenRef.current += 1;
+    if (upgradeTimerRef.current) {
+      clearTimeout(upgradeTimerRef.current);
+      upgradeTimerRef.current = null;
+    }
+  }, [cellLayoutWidth, pickPathForLayout]);
 
   const tryDesignPreviewBackfill = useCallback(() => {
     if (!needsDesignPreviewBackfill(file)) return;
@@ -152,6 +201,7 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
           thumbhash: updated.thumbhash,
           width: updated.width,
           height: updated.height,
+          filepath: updated.filepath,
         });
         failedDiskPathsRef.current = new Set();
         const next = pickGridThumbnailPath(updated);
@@ -159,12 +209,6 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
           setDisplayDiskPath(next);
           setThumbnailFailed(false);
         }
-        void fetchShellPreviewDataUrl(updated.filepath, 512).then((url) => {
-          if (url) {
-            setShellPreviewSrc(url);
-            setThumbnailFailed(false);
-          }
-        });
       },
     });
   }, [file, updateFile]);
@@ -205,6 +249,12 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
     tryDesignPreviewBackfill();
   }, [isActive, file.id, file.thumbnailMicroPath, file.thumbnailPath, tryDesignPreviewBackfill, file]);
 
+  // 作品集仅几张 design 时不必等 IntersectionObserver，挂载即补预览
+  useEffect(() => {
+    if (!needsDesignPreviewBackfill(file)) return;
+    tryDesignPreviewBackfill();
+  }, [file.id, file.filetype, file.filename, tryDesignPreviewBackfill, file]);
+
   useEffect(() => {
     const el = cardRef.current;
     if (!el) return;
@@ -212,7 +262,7 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
     const onVisible = () => {
       setIsInView(true);
       const failed = failedDiskPathsRef.current;
-      const base = pickGridThumbnailPath(file, failed);
+      const base = pickPathForLayout(failed);
       if (base) {
         void runWithImageDecodeSlot(async () => {
           setDisplayDiskPath((current) => {
@@ -230,11 +280,13 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
       const upgradeBase = base ?? displayDiskPath;
       upgradeTimerRef.current = setTimeout(() => {
         if (gen !== upgradeGenRef.current) return;
+        if (getGridZoomSettling()) return;
         const upgrade = pickGridUpgradePath(file, upgradeBase);
         if (!upgrade || failed.has(upgrade)) return;
         void runWithImageDecodeSlot(async () => {
+          await waitForGridZoomSettle();
           await waitForCanvasScrollIdle();
-          if (gen !== upgradeGenRef.current) return;
+          if (gen !== upgradeGenRef.current || getGridZoomSettling()) return;
           const probe = new Image();
           probe.decoding = 'async';
           probe.src = getAssetUrl(upgrade);
@@ -258,7 +310,7 @@ export const MediaCard = React.memo<MediaCardProps>(({ file, isInitiallyVisible 
         upgradeTimerRef.current = null;
       }
     };
-  }, [observe, unobserve, file, displayDiskPath, tryDesignPreviewBackfill]);
+  }, [observe, unobserve, file, displayDiskPath, pickPathForLayout, tryDesignPreviewBackfill]);
 
 
   const toFileUri = (filePath: string) => (

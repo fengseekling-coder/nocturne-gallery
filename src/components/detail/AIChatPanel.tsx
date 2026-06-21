@@ -1512,7 +1512,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = React.memo(({
                     {/* Model menu items — same structure as original, condensed for space */}
                     {hasOpenAiKey && (
                       <>
-                        <div style={{ padding: '8px 8px 4px', fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', fontFamily: 'var(--font-family)' }}>OpenAI-compatible {isFetchingModels && '…'}</div>
+                        <div style={{ padding: '8px 8px 4px', fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', fontFamily: 'var(--font-family)' }}>OpenAI 兼容接口 {isFetchingModels && '…'}</div>
                         {(openAiModels.length > 0 ? openAiModels : [openAiModel]).map(id => {
                           const isActive = currentProvider === 'openai' && openAiModel === id;
                           return <div key={id} onClick={() => handleSelectModel('openai', id)}
@@ -1536,7 +1536,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = React.memo(({
                     )}
                     {hasClaudeKey && (
                       <>
-                        <div style={{ padding: '8px 8px 4px', fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', fontFamily: 'var(--font-family)' }}>Claude {isFetchingModels && '…'}</div>
+                        <div style={{ padding: '8px 8px 4px', fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', fontFamily: 'var(--font-family)' }}>Claude（Anthropic） {isFetchingModels && '…'}</div>
                         {claudeModels.map(id => {
                           const isActive = currentProvider === 'claude' && claudeModel === id;
                           return <div key={id} onClick={() => handleSelectModel('claude', id)}
@@ -1544,7 +1544,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = React.memo(({
                             <span style={{ width: '4px', height: '4px', borderRadius: '50%', backgroundColor: isActive ? 'var(--accent)' : 'transparent', flexShrink: 0 }} />{id}
                           </div>;
                         })}
-                        {!isFetchingModels && claudeModels.length === 0 && <div style={{ padding: '6px 10px', fontSize: '11px', color: 'var(--text-muted)', fontFamily: 'var(--font-family)', fontStyle: 'italic' }}>无法获取模型列表，请检查 API Key</div>}
+                        {!isFetchingModels && claudeModels.length === 0 && <div style={{ padding: '6px 10px', fontSize: '11px', color: 'var(--text-muted)', fontFamily: 'var(--font-family)', fontStyle: 'italic' }}>无法获取模型列表，请检查接口密钥</div>}
                       </>
                     )}
                     {!isFetchingModels && bailianModels.length > 0 && (

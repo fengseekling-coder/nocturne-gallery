@@ -16,12 +16,12 @@ Gega Gallery is in an early public release. This roadmap tracks maintainer prior
 - Expand thumbnail rebuild diagnostics.
 - Add regression checks for group isolation and preview synchronization.
 
-## 0.3.x: Packaging
+## 0.3.x: Packaging (macOS)
 
-- Stabilize macOS app packaging.
-- Verify Windows packaging after migration cleanup.
-- Add release artifact checks.
-- Document platform-specific dependencies.
+- Stabilize macOS app packaging (`.app` / `.dmg`).
+- Add release artifact checks on macOS.
+- Document macOS build dependencies and notarization notes when ready.
+- *(Deferred)* Windows packaging until after macOS public release.
 
 ## 0.4.x: Maintainer Automation
 

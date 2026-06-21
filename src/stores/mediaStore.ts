@@ -177,6 +177,69 @@ const defaultFilter: MediaFilter = {
 
 const isDev = import.meta.env.DEV;
 
+type PendingLayoutDim = { width: number; height: number };
+const pendingLayoutDims = new Map<string, PendingLayoutDim>();
+let layoutDimFlushTimer: ReturnType<typeof setTimeout> | null = null;
+const LAYOUT_DIM_FLUSH_MS = 120;
+
+type MediaStoreSet = (
+  partial:
+    | Partial<MediaState>
+    | ((state: MediaState & MediaActions) => Partial<MediaState & MediaActions>),
+) => void;
+
+function flushPendingLayoutDimensions(set: MediaStoreSet): void {
+  layoutDimFlushTimer = null;
+  if (pendingLayoutDims.size === 0) return;
+
+  const batch = new Map(pendingLayoutDims);
+  pendingLayoutDims.clear();
+
+  set((state) => {
+    let changed = false;
+    const nextFiles = state.files.map((file) => {
+      const patch = batch.get(file.id);
+      if (!patch) return file;
+      if (file.width === patch.width && file.height === patch.height) return file;
+      changed = true;
+      return { ...file, width: patch.width, height: patch.height };
+    });
+    if (!changed) return state;
+
+    const nextFileById = new Map(nextFiles.map((f) => [f.id, f] as const));
+    let nextDetailCache = state.detailCache;
+    for (const mediaId of batch.keys()) {
+      const existingDetail = nextDetailCache[mediaId];
+      const file = nextFileById.get(mediaId);
+      if (!existingDetail || !file) continue;
+      if (existingDetail.file.width === file.width && existingDetail.file.height === file.height) continue;
+      if (nextDetailCache === state.detailCache) {
+        nextDetailCache = { ...state.detailCache };
+      }
+      nextDetailCache[mediaId] = { ...existingDetail, file };
+    }
+
+    for (const [mediaId, patch] of batch) {
+      const file = nextFileById.get(mediaId);
+      if (!file || file.width !== patch.width || file.height !== patch.height) continue;
+      void invoke('update_media_dimensions', { id: mediaId, width: patch.width, height: patch.height }).catch((err) => {
+        console.warn('[mediaStore] update_media_dimensions failed:', err);
+      });
+    }
+
+    return nextDetailCache === state.detailCache
+      ? { files: nextFiles }
+      : { files: nextFiles, detailCache: nextDetailCache };
+  });
+}
+
+function scheduleLayoutDimensionsFlush(set: MediaStoreSet): void {
+  if (layoutDimFlushTimer !== null) return;
+  layoutDimFlushTimer = setTimeout(() => {
+    flushPendingLayoutDimensions(set);
+  }, LAYOUT_DIM_FLUSH_MS);
+}
+
 function reconcileFiles(prevFiles: MediaFile[], incomingFiles: MediaFile[]): MediaFile[] {
   const prevById = new Map(prevFiles.map((file) => [file.id, file] as const));
   return incomingFiles.map((file) => {
@@ -778,27 +841,12 @@ export const useMediaStore = create<MediaState & MediaActions>((set, get) => ({
     if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
       return;
     }
-    set((state) => {
-      const file = state.files.find((f) => f.id === mediaId);
-      if (!file) return state;
-      if (file.width === width && file.height === height) return state;
-      const updated = { ...file, width, height };
-      const updatedFiles = state.files.map((f) => (f.id === mediaId ? updated : f));
-      const existingDetail = state.detailCache[mediaId];
-      void invoke('update_media_dimensions', { id: mediaId, width, height }).catch((err) => {
-        console.warn('[mediaStore] update_media_dimensions failed:', err);
-      });
-      if (!existingDetail) {
-        return { files: updatedFiles };
-      }
-      return {
-        files: updatedFiles,
-        detailCache: {
-          ...state.detailCache,
-          [mediaId]: { ...existingDetail, file: updated },
-        },
-      };
-    });
+    const file = get().files.find((f) => f.id === mediaId);
+    if (file && file.width === width && file.height === height) {
+      return;
+    }
+    pendingLayoutDims.set(mediaId, { width, height });
+    scheduleLayoutDimensionsFlush(set);
   },
 
   // ----------------------------------------------------------------

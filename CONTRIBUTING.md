@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest in Gega Gallery. This project is an early local-first desktop app, so contributions that improve reliability, maintainability, and cross-platform behavior are especially useful.
+Thanks for your interest in Gega Gallery. This project is an early local-first **macOS** desktop app, so contributions that improve reliability, maintainability, and macOS UX are especially useful. Windows/Linux ports are out of scope until after a stable macOS release.
 
 ## Development Setup
 

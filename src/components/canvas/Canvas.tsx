@@ -17,8 +17,7 @@ import { MediaCard } from './MediaCard';
 import { TopToolbar } from './TopToolbar';
 import { ContextMenu } from '../common/ContextMenu/ContextMenu';
 import { Icon } from '../common/Icon';
-import { WindowControls } from '../common/WindowControls';
-import { detectUiPlatform } from '../../lib/platform';
+
 // FullScreenPreview 内嵌在 Canvas 中，不再单独导入
 import { DuplicateModal } from '../common/DuplicateModal';
 import type { ContextMenuAction } from '../../types/context-menu';
@@ -208,9 +207,6 @@ const previewFilenameStyle: React.CSSProperties = {
   fontSize: '13px', color: 'var(--text-secondary)', fontWeight: 500,
   maxWidth: '50%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
 };
-const previewWindowCtrlsStyle: AppRegionStyle = {
-  width: '80px', display: 'flex', justifyContent: 'flex-end', WebkitAppRegion: 'no-drag',
-};
 const previewNavIconStyle: React.CSSProperties = { fontSize: '20px' };
 const previewNavBtnBaseStyle: React.CSSProperties = {
   width: '32px', height: '32px', display: 'flex', alignItems: 'center',
@@ -331,7 +327,6 @@ export const Canvas: React.FC<CanvasProps> = () => {
   const sourceFolder = useUiStore((s) => s.sourceFolder);
   const showToast = useUiStore((s) => s.showToast);
   const columnCount = useUiStore((s) => s.columnCount);
-  const isMacUi = detectUiPlatform() === 'macos';
   const showConfirm = useUiStore((s) => s.showConfirm);
   const targetFileId = useContextMenuStore((s) => s.targetFileId);
   const hideMenu = useContextMenuStore((s) => s.hideMenu);
@@ -1532,20 +1527,26 @@ export const Canvas: React.FC<CanvasProps> = () => {
     return () => observer.disconnect();
   }, [loadMore]);
 
-  // ResizeObserver：监听滚动容器宽度变化，驱动 Masonry 重新布局
+  // ResizeObserver：监听滚动容器「内容区」宽高（与 padding 内侧一致，瀑布流绝对定位以此为界）
   useEffect(() => {
     const el = contentRef.current;
     if (!el) return;
 
-    const measure = () => {
-      const rect = el.getBoundingClientRect();
-      setContainerWidth(el.clientWidth || rect.width || 0);
-      setViewportHeight(el.clientHeight || rect.height || 0);
+    const measureContentBox = () => {
+      const style = window.getComputedStyle(el);
+      const padX =
+        (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+      const padY =
+        (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
+      const contentW = Math.max(0, el.clientWidth - padX);
+      const contentH = Math.max(0, el.clientHeight - padY);
+      setContainerWidth(contentW);
+      setViewportHeight(contentH);
     };
 
-    measure();
+    measureContentBox();
 
-    const rafId = window.requestAnimationFrame(measure);
+    const rafId = window.requestAnimationFrame(measureContentBox);
     const observer = new ResizeObserver(entries => {
       if (entries[0]) {
         setContainerWidth(entries[0].contentRect.width);
@@ -2379,6 +2380,7 @@ export const Canvas: React.FC<CanvasProps> = () => {
                   >
                     <MediaCard
                       file={file}
+                      cellLayoutWidth={pos.width}
                       isInitiallyVisible={!USE_VIRTUAL ? true : index < EAGER_CARD_COUNT}
                       onDragStart={handleCardDragStart}
                       onDragEnd={handleCardDragEnd}
@@ -2430,12 +2432,6 @@ export const Canvas: React.FC<CanvasProps> = () => {
             </button>
 
             <span style={previewFilenameStyle}>{activeCanvasAttachmentItem?.filename ?? '附件内容'}</span>
-
-            {!isMacUi && (
-              <div className="no-drag" style={previewWindowCtrlsStyle}>
-                <WindowControls topOffset={0} rightOffset={0} />
-              </div>
-            )}
           </div>
 
           <div
@@ -2539,12 +2535,6 @@ export const Canvas: React.FC<CanvasProps> = () => {
             </button>
 
             <span style={previewFilenameStyle}>{files[previewIndex].filename}</span>
-
-            {!isMacUi && (
-              <div className="no-drag" style={previewWindowCtrlsStyle}>
-                <WindowControls topOffset={0} rightOffset={0} />
-              </div>
-            )}
           </div>
 
           <div

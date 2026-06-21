@@ -11,9 +11,7 @@ import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react'
 import { invoke } from '@tauri-apps/api/core';
 import { useUiStore } from '../../stores/uiStore';
 import { useMediaStore } from '../../stores/mediaStore';
-import { GegaLogo } from '../common/GegaLogo';
 import { Icon } from '../common/Icon';
-import { detectUiPlatform } from '../../lib/platform';
 import { WindowControls } from '../common/WindowControls';
 
 // Tweaks 色板是用户可选的品牌色配置值，不是组件样式色。
@@ -143,8 +141,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
   const setColumnCount = useUiStore((s) => s.setColumnCount);
   const metaMode = useUiStore((s) => s.metaMode);
   const setMetaMode = useUiStore((s) => s.setMetaMode);
-  const isMacUi = detectUiPlatform() === 'macos';
-
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [isAddingGroup, setIsAddingGroup] = useState(false);
   const [newGroupName, setNewGroupName] = useState('');
@@ -582,44 +578,20 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
         fontFamily: 'var(--font-family)',
       }}
     >
-      {/* Logo 区域（macOS：左侧红绿灯 + 标题） */}
+      {/* 顶栏（macOS：仅红绿灯，其余为拖拽区） */}
       <div
         data-tauri-drag-region
         style={{
           height: '48px',
-          padding: '0 12px 0 0',
+          padding: '0 12px',
           display: 'flex',
           alignItems: 'center',
-          gap: '10px',
+          gap: '12px',
           borderBottom: '1px solid var(--border)',
           flexShrink: 0,
-          position: 'relative',
         }}
       >
-        {isMacUi && (
-          <WindowControls topOffset={0} leftOffset={0} />
-        )}
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '10px',
-            flex: 1,
-            minWidth: 0,
-            paddingLeft: isMacUi ? '72px' : '16px',
-          }}
-        >
-          <GegaLogo width={22} height={22} />
-          <span style={{
-            fontFamily: 'var(--font-family)',
-            fontSize: '15px',
-            fontWeight: 700,
-            color: 'var(--accent)',
-            letterSpacing: '-0.02em',
-          }}>
-            Gega
-          </span>
-        </div>
+        <WindowControls inline />
       </div>
 
       {/* 中部：主导航固定 + 自定义分组独立滚动（AGENTS §3.3 三段式） */}
@@ -659,8 +631,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
                 onDragLeave={item.acceptsDrop ? handleDragLeave : undefined}
                 onDrop={item.acceptsDrop ? (e) => item.targetFolder && handleDrop(item.targetFolder, e) : undefined}
                 style={{
-                  position: 'relative',
-                  overflow: 'hidden', // 让子元素绝对定位的竖条跟随圆角，且不溢出到 nav 容器外
                   display: 'flex',
                   alignItems: 'center',
                   gap: '10px',
@@ -693,19 +663,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
                   }
                 }}
               >
-                {/* 激活态左侧竖线 — position:absolute 在 overflow:hidden 的父按钮内，不受 nav 裁剪 */}
-                {isActive && (
-                  <span style={{
-                    position: 'absolute',
-                    left: 0,
-                    top: '8px',
-                    bottom: '8px',
-                    width: '2px',
-                    background: 'var(--accent)',
-                    borderRadius: '2px',
-                    pointerEvents: 'none',
-                  }} />
-                )}
                 <Icon
                   name={item.icon}
                   size={18}
@@ -809,8 +766,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
                     onDragLeave={handleDragLeave}
                     onDrop={(e) => handleGroupDrop(group, e)}
                     style={{
-                      position: 'relative',
-                      overflow: 'hidden',
                       display: 'flex', alignItems: 'center', gap: '8px',
                       width: '100%', padding: '6px 10px',
                       background: (isActive || isDragOver) ? 'var(--accent-soft)' : 'transparent',
@@ -828,20 +783,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
                       if (!isActive && !isDragOver) e.currentTarget.style.backgroundColor = 'transparent';
                     }}
                   >
-                    {(isActive || isDragOver) && (
-                      <span
-                        style={{
-                          position: 'absolute',
-                          left: 0,
-                          top: '6px',
-                          bottom: '6px',
-                          width: '2px',
-                          background: 'var(--accent)',
-                          borderRadius: '0 2px 2px 0',
-                          pointerEvents: 'none',
-                        }}
-                      />
-                    )}
                     <span style={{
                       width: '6px', height: '6px', borderRadius: '50%', flexShrink: 0,
                       backgroundColor: (isActive || isDragOver) ? 'var(--accent)' : dotColor,
@@ -944,7 +885,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
         >
           <Icon name="tune" size={16} style={{ opacity: tweaksOpen ? 1 : 0.65, color: tweaksOpen ? 'var(--accent)' : 'inherit' }} />
           <span style={{ flex: 1 }}>外观调整</span>
-          <span style={{ fontSize: '10px', color: tweaksOpen ? 'var(--accent)' : 'var(--text-faint)', fontFamily: 'var(--font-family)' }}>T</span>
+          <span style={{ fontSize: '10px', color: tweaksOpen ? 'var(--accent)' : 'var(--text-faint)', fontFamily: 'var(--font-family)' }}>快捷键 T</span>
         </button>
 
         {/* 分割线 */}
@@ -968,7 +909,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
         >
           <Icon name="settings" size={16} opacity={0.65} />
           <span style={{ flex: 1 }}>设置</span>
-          <span style={{ fontSize: '10px', color: 'var(--text-faint)', fontFamily: 'var(--font-family)' }}>Ctrl ,</span>
+          <span style={{ fontSize: '10px', color: 'var(--text-faint)', fontFamily: 'var(--font-family)' }}>⌘,</span>
         </button>
       </div>
 
@@ -1012,7 +953,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ onOpenPreferences, libraryRoot
               fontSize: '10px', letterSpacing: '0.14em', textTransform: 'uppercase',
               color: 'var(--accent)', fontWeight: 700,
             }}>
-              Tweaks
+              外观微调
             </span>
             <button
               onClick={() => setTweaksOpen(false)}

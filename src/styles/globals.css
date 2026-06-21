@@ -187,56 +187,28 @@ html {
   cursor: grabbing;
 }
 
-/* ========== Canvas 缩放滑块 ========== */
-.zoom-slider {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 72px;
-  height: 3px;
-  background: var(--slider-track);
-  border-radius: 2px;
+/* ========== 顶部栏网格缩放滑块（自定义轨道，圆点与横线垂直居中） ========== */
+.column-zoom-slider {
   outline: none;
-  cursor: pointer;
-  position: relative;
-  z-index: 1;
+  user-select: none;
 }
-.zoom-slider:focus {
-  outline: none;
+.column-zoom-slider.is-dragging,
+.column-zoom-slider:active {
+  cursor: grabbing;
 }
-.zoom-slider:focus-visible {
-  outline: none;
+.column-zoom-slider__thumb {
+  transition: transform 0.12s ease, box-shadow 0.12s ease, left 0.08s ease;
 }
-.zoom-slider::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--accent);
-  cursor: pointer;
-  transition: transform 0.1s ease;
-  margin-top: 0;
+.column-zoom-slider__thumb.is-dragging {
+  transition: none;
 }
-.zoom-slider::-webkit-slider-thumb:hover {
-  transform: scale(1.3);
+.column-zoom-slider:hover .column-zoom-slider__thumb:not(.is-dragging) {
+  transform: scale(1.15);
 }
-.zoom-slider::-moz-range-thumb {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--accent);
-  border: none;
-  cursor: pointer;
-}
-.zoom-slider::-webkit-slider-runnable-track {
-  height: 3px;
-  background: var(--slider-track);
-  border-radius: 2px;
-}
-.zoom-slider::-moz-range-track {
-  height: 3px;
-  background: var(--slider-track);
-  border-radius: 2px;
+.column-zoom-slider:focus-visible .column-zoom-slider__thumb {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
 }
 
 /* ========== 加载旋转动画 ========== */

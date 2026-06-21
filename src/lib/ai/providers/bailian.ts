@@ -26,7 +26,7 @@ export class BailianProvider implements AIProvider {
 
   async chat(messages: Message[], tools: Tool[], onChunk: (chunk: StreamChunk) => void): Promise<void> {
     const apiKey = await getPreference('bailian_api_key', '');
-    if (!apiKey) throw new Error('百炼 API Key 未配置');
+    if (!apiKey) throw new Error('百炼接口密钥未配置');
     const model = await getPreference('bailian_model', 'qwen-plus');
     const latestVisualMessageId = getLatestVisualMessageId(messages);
 

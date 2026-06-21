@@ -205,8 +205,34 @@ pub fn ensure_psd_design_thumbnails(
         }
     }
 
-    let legacy_jpg = meta_dir.join(format!("{}_thumb.jpg", filename));
-    if legacy_jpg.is_file() {
+    let path_obj = std::path::Path::new(filepath);
+    let mut legacy_candidates: Vec<std::path::PathBuf> = Vec::new();
+    let mut push_legacy = |base: &str| {
+        let p = meta_dir.join(format!("{}_thumb.jpg", base));
+        if !legacy_candidates.iter().any(|x| x == &p) {
+            legacy_candidates.push(p);
+        }
+    };
+    push_legacy(filename);
+    if let Some(stem) = std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+    {
+        push_legacy(stem);
+    }
+    if let Some(disk) = path_obj.file_name().and_then(|n| n.to_str()) {
+        push_legacy(disk);
+        if let Some(stem) = std::path::Path::new(disk)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        {
+            push_legacy(stem);
+        }
+    }
+    for legacy_jpg in legacy_candidates {
+        if !legacy_jpg.is_file() {
+            continue;
+        }
         if let Ok(bytes) = std::fs::read(&legacy_jpg) {
             if let Some(path) = ensure_design_preview_from_raster_bytes(
                 media_id, filepath, filename, meta_dir, db_path, &bytes,
@@ -222,9 +248,11 @@ pub fn ensure_psd_design_thumbnails(
     }
 
     if let Some(bytes) = crate::media::os_preview::fetch_os_preview_bytes(filepath, 512) {
-        return ensure_design_preview_from_raster_bytes(
+        if let Some(path) = ensure_design_preview_from_raster_bytes(
             media_id, filepath, filename, meta_dir, db_path, &bytes,
-        );
+        ) {
+            return Some(path);
+        }
     }
 
     log::warn!(

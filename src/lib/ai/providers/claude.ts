@@ -55,7 +55,7 @@ export class ClaudeProvider implements AIProvider {
 
   async chat(messages: Message[], tools: Tool[], onChunk: (chunk: StreamChunk) => void): Promise<void> {
     const apiKey = await getPreference('claude_api_key', '');
-    if (!apiKey) throw new Error('Claude API Key not configured');
+    if (!apiKey) throw new Error('Claude 接口密钥未配置');
 
     // 修复：[P1] 从用户配置读取模型名，不再硬编码
     // 用户在首选项中配置的 claude 模型 id 存于 'claude_model'
