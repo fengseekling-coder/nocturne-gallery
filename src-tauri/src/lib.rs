@@ -1,6 +1,7 @@
 mod commands;
 pub mod db;
 pub mod media;
+mod menu;
 pub mod models;
 
 use commands::*;
@@ -321,7 +322,14 @@ pub fn run() {
                 let _ = win.set_focus();
             }
 
+            if let Ok(app_menu) = menu::build_app_menu(app.handle()) {
+                app.set_menu(app_menu)?;
+            }
+
             Ok(())
+        })
+        .on_menu_event(|app, event| {
+            menu::handle_menu_event(app, event.id().as_ref());
         })
         // 应用退出时的清理钩子
         .on_window_event(move |window, event| {

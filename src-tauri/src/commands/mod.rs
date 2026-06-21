@@ -28,15 +28,15 @@ pub struct BatchFileOperationResult {
     pub first_error: Option<String>,
 }
 
-fn collect_file_drag_paths(paths: Vec<String>) -> Result<Vec<PathBuf>, String> {
+fn collect_file_drag_paths(paths: Vec<String>, library_root: &str) -> Result<Vec<PathBuf>, String> {
     if paths.is_empty() {
         return Err("没有可拖出的文件".to_string());
     }
 
     let mut drag_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
     for path in paths {
-        let path_buf = std::fs::canonicalize(&path)
-            .map_err(|e| format!("无法读取拖拽文件：{} ({})", path, e))?;
+        // 路径守卫（A 类）：只允许拖出库内已存在的文件。
+        let path_buf = resolve_under_library_root(&path, library_root)?;
         if !path_buf.is_file() {
             return Err(format!("只能拖出文件：{}", path_buf.display()));
         }
@@ -46,7 +46,6 @@ fn collect_file_drag_paths(paths: Vec<String>) -> Result<Vec<PathBuf>, String> {
     Ok(drag_paths)
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn start_native_file_drag(window: &tauri::Window, drag_paths: Vec<PathBuf>) -> Result<(), String> {
     let preview = drag_paths
         .first()
@@ -65,19 +64,9 @@ fn start_native_file_drag(window: &tauri::Window, drag_paths: Vec<PathBuf>) -> R
 
 #[command]
 pub fn start_file_drag(window: tauri::Window, paths: Vec<String>) -> Result<(), String> {
-    let drag_paths = collect_file_drag_paths(paths)?;
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    {
-        start_native_file_drag(&window, drag_paths)
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = window;
-        let _ = drag_paths;
-        Err("当前平台暂不支持从应用拖出文件".to_string())
-    }
+    let library_root = library_root(window.app_handle())?;
+    let drag_paths = collect_file_drag_paths(paths, &library_root)?;
+    start_native_file_drag(&window, drag_paths)
 }
 
 fn media_id_by_filepath(conn: &rusqlite::Connection, filepath: &str) -> Result<String, String> {
@@ -464,6 +453,77 @@ fn validate_library_relative_folder(folder: &str) -> Result<String, String> {
     }
 
     Ok(trimmed.to_string())
+}
+
+/// 统一的库根落盘校验入口：对输入路径做规范化（解析符号链接、消除 `..`、借助
+/// `canonicalize` 处理 macOS 大小写不敏感与 Unicode 归一化差异），确认目标位于
+/// 库根之内后返回规范化的目标路径。当目标文件尚不存在（典型的落盘前场景）时，
+/// 改为规范化其父目录再拼接文件名。越界或非法路径返回可读中文错误，不 panic。
+fn resolve_under_library_root(
+    input_path: &str,
+    library_root: &str,
+) -> Result<std::path::PathBuf, String> {
+    let trimmed = input_path.trim();
+    if trimmed.is_empty() || trimmed.contains("://") {
+        return Err("路径无效".to_string());
+    }
+
+    let root_trimmed = library_root.trim();
+    if root_trimmed.is_empty() {
+        return Err("未配置素材库根目录".to_string());
+    }
+
+    let canonical_root = std::fs::canonicalize(root_trimmed)
+        .map_err(|e| format!("无法访问素材库根目录：{} ({})", root_trimmed, e))?;
+
+    // 目标已存在时直接规范化（可解析符号链接与大小写差异）。
+    let canonical_target = match std::fs::canonicalize(trimmed) {
+        Ok(path) => path,
+        Err(_) => {
+            // 目标尚不存在（典型的落盘前场景）：向上找到最近的已存在祖先目录并
+            // 规范化它，再拼接尚不存在的剩余路径段。剩余段中若出现 `..` 等穿越
+            // 组件一律拒绝，避免绕过库根边界。
+            let raw = std::path::Path::new(trimmed);
+            let mut existing = raw;
+            let mut tail: Vec<std::ffi::OsString> = Vec::new();
+            loop {
+                if existing.exists() {
+                    break;
+                }
+                let file_name = existing
+                    .file_name()
+                    .ok_or_else(|| format!("路径无效：{}", input_path))?;
+                tail.push(file_name.to_os_string());
+                existing = existing
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .ok_or_else(|| format!("无法定位已存在的父目录：{}", input_path))?;
+            }
+            let mut resolved = std::fs::canonicalize(existing)
+                .map_err(|e| format!("无法访问目标目录：{} ({})", existing.display(), e))?;
+            for component in tail.iter().rev() {
+                let comp_path = std::path::Path::new(component);
+                let is_normal = comp_path
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)));
+                if !is_normal {
+                    return Err("路径包含非法的穿越组件".to_string());
+                }
+                resolved.push(component);
+            }
+            resolved
+        }
+    };
+
+    if canonical_target == canonical_root || canonical_target.starts_with(&canonical_root) {
+        Ok(canonical_target)
+    } else {
+        Err(format!(
+            "路径超出素材库范围（目标：{}，库根：{}）",
+            canonical_target.display(),
+            canonical_root.display()
+        ))
+    }
 }
 
 const TRASH_FOLDER_NAME: &str = "回收站";
@@ -916,18 +976,12 @@ pub async fn scan_directory(handle: AppHandle, path: String) -> Result<ScanResul
     let library_root = library_root(&handle)?;
     eprintln!("[scan_directory] Library root: {}", library_root);
 
-    // éªŒè¯æ‰«æè·¯å¾„å¿…é¡»åœ¨åº“æ ¹ç›®å½•èŒƒå›´å†…
-    if !same_or_descendant_path(
-        std::path::Path::new(&path),
-        std::path::Path::new(&library_root),
-    ) {
-        let err = format!(
-            "禁止扫描库目录以外的路径：{} (库根：{})",
-            path, library_root
-        );
-        eprintln!("[scan_directory] Security check failed: {}", err);
-        return Err(err);
-    }
+    // 路径守卫（A 类）：扫描路径必须等于库根或位于库根之内（统一入口，已规范化）。
+    let resolved = resolve_under_library_root(&path, &library_root).map_err(|e| {
+        eprintln!("[scan_directory] Security check failed: {}", e);
+        e
+    })?;
+    let path = resolved.to_string_lossy().to_string();
     eprintln!("[scan_directory] Security check passed");
 
     let db = match db_path(&handle) {
@@ -1272,7 +1326,12 @@ fn hbitmap_to_data_url(hbitmap: HBITMAP) -> Result<String, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn shell_thumbnail_preview_data_url(path: &str, size: u32) -> Result<Option<String>, String> {
+fn shell_thumbnail_preview_data_url(
+    path: &str,
+    size: u32,
+    _library_root: &str,
+    _filename_hint: Option<&str>,
+) -> Result<Option<String>, String> {
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     let initialized_com = if hr.is_ok() {
         true
@@ -1318,12 +1377,25 @@ fn shell_thumbnail_preview_data_url(path: &str, size: u32) -> Result<Option<Stri
 }
 
 #[cfg(target_os = "macos")]
-fn shell_thumbnail_preview_data_url(path: &str, size: u32) -> Result<Option<String>, String> {
+fn shell_thumbnail_preview_data_url(
+    path: &str,
+    size: u32,
+    library_root: &str,
+    filename_hint: Option<&str>,
+) -> Result<Option<String>, String> {
     let preview_size = size.clamp(96, 1024);
-    let resolved = crate::media::path_util::resolve_regular_file_path(path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string());
-    match crate::media::os_preview::fetch_os_preview_bytes(&resolved, preview_size) {
+    let root_opt = library_root.trim();
+    let root = if root_opt.is_empty() {
+        None
+    } else {
+        Some(root_opt)
+    };
+    match crate::media::os_preview::fetch_os_preview_bytes_with_hints(
+        path,
+        root,
+        filename_hint,
+        preview_size,
+    ) {
         Some(bytes) => {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
             Ok(Some(format!("data:image/png;base64,{}", encoded)))
@@ -1333,7 +1405,12 @@ fn shell_thumbnail_preview_data_url(path: &str, size: u32) -> Result<Option<Stri
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-fn shell_thumbnail_preview_data_url(_path: &str, _size: u32) -> Result<Option<String>, String> {
+fn shell_thumbnail_preview_data_url(
+    _path: &str,
+    _size: u32,
+    _library_root: &str,
+    _filename_hint: Option<&str>,
+) -> Result<Option<String>, String> {
     Ok(None)
 }
 
@@ -1471,13 +1548,23 @@ pub async fn remove_media_attachment(
 
 #[command]
 pub async fn get_attachment_preview_data(
+    handle: AppHandle,
     path: String,
     size: Option<u32>,
+    filename: Option<String>,
 ) -> Result<Option<String>, String> {
     let preview_size = size.unwrap_or(320).clamp(96, 1024);
-    tokio::task::spawn_blocking(move || shell_thumbnail_preview_data_url(&path, preview_size))
-        .await
-        .map_err(|e| format!("Task join error: {}", e))?
+    let library_root = library_root(&handle).unwrap_or_default();
+    let name = filename;
+    // 路径守卫（B 类）：附件预览可能读取库外文件，做存在性 + 规范化校验（拒绝 `..` 穿越），不强制库内。
+    let path = validate_existing_local_path(&path)?
+        .to_string_lossy()
+        .to_string();
+    tokio::task::spawn_blocking(move || {
+        shell_thumbnail_preview_data_url(&path, preview_size, &library_root, name.as_deref())
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
 }
 
 fn design_preview_already_complete(file: &crate::models::MediaFile) -> bool {
@@ -1497,9 +1584,16 @@ pub async fn ensure_media_preview_thumbnails(
     let db = db_path(&handle)?;
     let library_root = library_root(&handle).unwrap_or_default();
     eprintln!("[ensure_media_preview_thumbnails] invoked id={}", media_id);
-    tokio::task::spawn_blocking(move || {
+    let (opt, metadata_changed) = tokio::task::spawn_blocking(
+        move || -> Result<(Option<crate::models::MediaFile>, bool), String> {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
         let file = crud::get_media_file_by_id(&conn, &media_id).map_err(|e| e.to_string())?;
+        let snapshot_before = (
+            file.thumbnail_micro_path.clone(),
+            file.thumbnail_path.clone(),
+            file.thumbnail_preview_path.clone(),
+            file.filepath.clone(),
+        );
         eprintln!(
             "[ensure_media_preview_thumbnails] file={} type={} thumb={:?} micro={:?}",
             file.filename,
@@ -1528,7 +1622,11 @@ pub async fn ensure_media_preview_thumbnails(
                 library_root_opt,
                 folder_hint
             );
-            return Ok(Some(file));
+            let changed = file.thumbnail_micro_path != snapshot_before.0
+                || file.thumbnail_path != snapshot_before.1
+                || file.thumbnail_preview_path != snapshot_before.2
+                || file.filepath != snapshot_before.3;
+            return Ok((Some(file), changed));
         };
         let disk_path = resolved_path.to_string_lossy().to_string();
         if disk_path != file.filepath {
@@ -1561,7 +1659,11 @@ pub async fn ensure_media_preview_thumbnails(
         let file = crud::get_media_file_by_id(&conn, &media_id).map_err(|e| e.to_string())?;
         if design_preview_already_complete(&file) {
             eprintln!("[ensure_media_preview_thumbnails] ok (sidecar or DB already has tiers)");
-            return Ok(Some(file));
+            let changed = file.thumbnail_micro_path != snapshot_before.0
+                || file.thumbnail_path != snapshot_before.1
+                || file.thumbnail_preview_path != snapshot_before.2
+                || file.filepath != snapshot_before.3;
+            return Ok((Some(file), changed));
         }
 
         let ext = crate::media::design_source::ext_lower_from_path(&resolved_path);
@@ -1598,30 +1700,30 @@ pub async fn ensure_media_preview_thumbnails(
         }
 
         let updated = crud::get_media_file_by_id(&conn, &media_id).map_err(|e| e.to_string())?;
+        let metadata_changed = updated.thumbnail_micro_path != snapshot_before.0
+            || updated.thumbnail_path != snapshot_before.1
+            || updated.thumbnail_preview_path != snapshot_before.2
+            || updated.filepath != snapshot_before.3;
         eprintln!(
-            "[ensure_media_preview_thumbnails] done thumb={:?} micro={:?}",
+            "[ensure_media_preview_thumbnails] done thumb={:?} micro={:?} changed={}",
             updated.thumbnail_path,
-            updated.thumbnail_micro_path
+            updated.thumbnail_micro_path,
+            metadata_changed
         );
-        Ok(Some(updated))
+        Ok((Some(updated), metadata_changed))
     })
     .await
-    .map_err(|e| format!("Task join error: {}", e))?
-    .map(|opt| {
+    .map_err(|e| format!("Task join error: {}", e))??;
+
+    if metadata_changed {
         if let Some(ref updated) = opt {
-            if crate::media::design_source::has_modern_webp_tiers(
-                updated.thumbnail_micro_path.as_deref(),
-                updated.thumbnail_path.as_deref(),
-                updated.thumbnail_preview_path.as_deref(),
-            ) {
-                let _ = handle.emit(
-                    "media_metadata_updated",
-                    serde_json::json!({ "id": updated.id }),
-                );
-            }
+            let _ = handle.emit(
+                "media_metadata_updated",
+                serde_json::json!({ "id": updated.id }),
+            );
         }
-        opt
-    })
+    }
+    Ok(opt)
 }
 
 #[command]
@@ -1668,6 +1770,7 @@ pub async fn read_attachment_preview(
     attachment_id: String,
 ) -> Result<String, String> {
     let db = db_path(&handle)?;
+    let library_root = library_root(&handle).unwrap_or_default();
     tokio::task::spawn_blocking(move || {
         let conn = open_conn(&db).map_err(|e| e.to_string())?;
         let filepath: String = conn
@@ -1720,7 +1823,8 @@ pub async fn read_attachment_preview(
             ));
         }
 
-        match shell_thumbnail_preview_data_url(&filepath, 320)
+        let filename_hint = path.file_name().and_then(|n| n.to_str());
+        match shell_thumbnail_preview_data_url(&filepath, 320, &library_root, filename_hint)
             .map_err(|_| "preview_unavailable".to_string())?
         {
             Some(preview) => Ok(preview),
@@ -2815,16 +2919,10 @@ fn restart_library_watcher(handle: &AppHandle, root: &str) {
     }
 }
 
-/// 前端 UI 平台：macos | windows | linux（按当前 Tauri 二进制目标，不依赖 WebView UA）
+/// 前端 UI 平台（当前阶段仅 macOS 桌面端）
 #[command]
 pub fn get_native_platform() -> String {
-    if cfg!(target_os = "macos") {
-        "macos".to_string()
-    } else if cfg!(target_os = "windows") {
-        "windows".to_string()
-    } else {
-        "linux".to_string()
-    }
+    "macos".to_string()
 }
 
 /// èŽ·å–åº“æ ¹ç›®å½•è·¯å¾„
@@ -3567,10 +3665,13 @@ pub async fn import_file_to_library(
         .to_string();
 
     // æž„å»ºç›®æ ‡è·¯å¾„ï¼šlib_root + target_folder + filename
+    let target_folder = validate_library_relative_folder(&target_folder)?;
     let target_path = std::path::Path::new(&library_root)
         .join(&target_folder)
         .join(&filename);
 
+    // 路径守卫（A 类）：落盘目标必须落在库根之内。
+    let target_path = resolve_under_library_root(&target_path.to_string_lossy(), &library_root)?;
     let target_path_str = target_path.to_string_lossy().to_string();
     log::debug!("[import_file_to_library] Target path: {}", target_path_str);
 
@@ -3827,6 +3928,8 @@ pub async fn import_paths_to_library(
 
         let library_root = library_root(&handle_for_task)?;
         let db = db_path(&handle_for_task)?;
+        // 路径守卫（A 类）：目标文件夹必须是库内相对目录。
+        let target_folder = validate_library_relative_folder(&target_folder)?;
         let target_root = std::path::Path::new(&library_root).join(&target_folder);
         std::fs::create_dir_all(&target_root)
             .map_err(|e| format!("Failed to create target folder: {}", e))?;
@@ -3860,6 +3963,20 @@ pub async fn import_paths_to_library(
                 };
 
                 let target_path = target_root.join(filename);
+                // 路径守卫（A 类）：逐项确认落盘目标仍在库根之内。
+                let target_path =
+                    match resolve_under_library_root(&target_path.to_string_lossy(), &library_root)
+                    {
+                        Ok(path) => path,
+                        Err(err) => {
+                            log::warn!(
+                                "[import_paths_to_library] Reject out-of-range target: {}",
+                                err
+                            );
+                            failed_count += 1;
+                            continue;
+                        }
+                    };
                 if target_path.exists() || !seen_destinations.insert(target_path.clone()) {
                     skipped_count += 1;
                     continue;
@@ -3902,6 +4019,20 @@ pub async fn import_paths_to_library(
                 };
 
                 let target_path = target_root.join(&folder_name).join(relative_path);
+                // 路径守卫（A 类）：递归导入的每个落盘目标也必须在库根之内。
+                let target_path =
+                    match resolve_under_library_root(&target_path.to_string_lossy(), &library_root)
+                    {
+                        Ok(path) => path,
+                        Err(err) => {
+                            log::warn!(
+                                "[import_paths_to_library] Reject out-of-range target: {}",
+                                err
+                            );
+                            failed_count += 1;
+                            continue;
+                        }
+                    };
                 if target_path.exists() || !seen_destinations.insert(target_path.clone()) {
                     skipped_count += 1;
                     continue;
@@ -4237,6 +4368,11 @@ pub async fn batch_delete_files_permanently(
 pub async fn save_file_as(handle: AppHandle, source_path: String) -> Result<String, String> {
     eprintln!("[save_file_as] Saving file: {}", source_path);
 
+    // 路径守卫（B 类）：源文件做存在性 + 规范化校验；目标走系统保存对话框，可在库外。
+    let source_path = validate_existing_local_path(&source_path)?
+        .to_string_lossy()
+        .to_string();
+
     // èŽ·å–é»˜è®¤æ–‡ä»¶å
     let default_name = std::path::Path::new(&source_path)
         .file_name()
@@ -4383,6 +4519,9 @@ pub async fn import_generated_image_to_ai_prompts(
             suffix += 1;
         }
 
+        // 路径守卫（A 类）：生成图落盘目标必须落在库根之内。
+        let target_path =
+            resolve_under_library_root(&target_path.to_string_lossy(), &library_root)?;
         let target_path_str = target_path.to_string_lossy().to_string();
         let filename = target_path
             .file_name()
@@ -4481,6 +4620,11 @@ pub async fn extract_colors(
 
     eprintln!("[extract_colors] No cache found, extracting from image...");
 
+    // 路径守卫（B 类）：可能读取外部附件，做存在性 + 规范化校验（拒绝 `..` 穿越），不强制库内。
+    let file_path = validate_existing_local_path(&file_path)?
+        .to_string_lossy()
+        .to_string();
+
     // 没有缓存，从图片提取（复用公共函数）
     let file_path_clone = file_path.clone();
     let top_colors: Vec<String> =
@@ -4546,10 +4690,14 @@ pub async fn save_clipboard_image(
 
     // Determine target folder based on current context.
     let target_folder = target_folder.unwrap_or_else(|| "灵感库".to_string());
+    // 路径守卫（A 类）：目标文件夹必须是库内相对目录。
+    let target_folder = validate_library_relative_folder(&target_folder)?;
     let target_path = std::path::Path::new(&library_root)
         .join(&target_folder)
         .join(&file_name);
 
+    // 路径守卫（A 类）：剪贴板图片落盘目标必须落在库根之内（同时拦截 file_name 中的穿越）。
+    let target_path = resolve_under_library_root(&target_path.to_string_lossy(), &library_root)?;
     let target_path_str = target_path.to_string_lossy().to_string();
     eprintln!("[save_clipboard_image] Target path: {}", target_path_str);
 
@@ -4562,8 +4710,10 @@ pub async fn save_clipboard_image(
             "filename": file_name.clone(),
         }),
     );
-    std::fs::create_dir_all(std::path::Path::new(&library_root).join(&target_folder))
-        .map_err(|e| format!("Failed to create target folder: {}", e))?;
+    if let Some(parent) = target_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create target folder: {}", e))?;
+    }
 
     // Write image bytes directly to the target file
     std::fs::write(&target_path, image_bytes)
@@ -4737,6 +4887,8 @@ pub async fn check_duplicate(
 /// èŽ·å–æ–‡ä»¶åŸºæœ¬ä¿¡æ¯ï¼ˆå¤§å°ï¼‰
 #[command]
 pub async fn get_file_info(path: String) -> Result<FileInfo, String> {
+    // 路径守卫（B 类）：可能读取外部附件，做存在性 + 规范化校验（拒绝 `..` 穿越），不强制库内。
+    let path = validate_existing_local_path(&path)?;
     let metadata =
         std::fs::metadata(&path).map_err(|e| format!("Failed to read file metadata: {}", e))?;
 
@@ -4760,6 +4912,10 @@ pub async fn replace_file(
 
     let db = db_path(&handle)?;
     let library_root = library_root(&handle)?;
+    // 路径守卫（B 类）：替换用的源文件可来自库外（合法导入），做存在性 + 规范化校验。
+    let source_path = validate_existing_local_path(&source_path)?
+        .to_string_lossy()
+        .to_string();
     let thumbs_dir = std::path::Path::new(&library_root)
         .join(".nocturne")
         .join("thumbs")
@@ -4795,6 +4951,8 @@ pub async fn replace_file(
         .parent()
         .ok_or_else(|| "Invalid target path".to_string())?;
     let dest_path = target_dir.join(&target_filename);
+    // 路径守卫（A 类）：被替换的目标文件必须落在库根之内。
+    let dest_path = resolve_under_library_root(&dest_path.to_string_lossy(), &library_root)?;
     let tmp_path = target_dir.join(format!("{}.tmp", target_filename));
 
     if let Err(e) = std::fs::copy(&source_path, &tmp_path) {
