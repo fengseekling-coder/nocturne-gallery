@@ -5,9 +5,11 @@ mod menu;
 pub mod models;
 
 use commands::*;
+use commands::DestructiveTokenStore;
 use media::thumbnail_queue::ThumbnailQueue;
 use media::watcher::LibraryWatcher;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use tauri::{Emitter, Manager};
@@ -57,6 +59,7 @@ pub fn run() {
             library_watcher: Mutex::new(None),
             background_thread: Mutex::new(None),
         })
+        .manage(DestructiveTokenStore(Mutex::new(HashMap::new())))
         .setup(move |app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
@@ -378,6 +381,7 @@ pub fn run() {
             reconcile_trash_with_disk,
             get_trash_diagnostics,
             empty_trash,
+            request_destructive_token,
             init_library,
             get_native_platform,
             get_library_root,

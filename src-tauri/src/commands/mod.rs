@@ -19,6 +19,49 @@ use crate::AppState;
 
 type StartupBackfillRow = (String, String, Option<String>, Option<String>);
 
+/// 破坏性命令服务端二次确认：保存一次性 confirmation token。
+/// key = token，value = (operation_name, issued_at)。
+pub struct DestructiveTokenStore(pub std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>);
+
+/// confirmation token 有效期，超时即视为失效。
+const DESTRUCTIVE_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 为某个破坏性操作签发一次性 confirmation token。
+/// 前端必须先调用本命令拿到 token，再把它作为 `confirmationToken` 传给对应的破坏性命令。
+#[command]
+pub async fn request_destructive_token(
+    handle: AppHandle,
+    operation: String,
+) -> Result<String, String> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let store = handle.state::<DestructiveTokenStore>();
+    let mut map = store.0.lock().map_err(|e| e.to_string())?;
+    // 清理过期 token，避免 map 无限增长。
+    map.retain(|_, (_, issued)| issued.elapsed() < DESTRUCTIVE_TOKEN_TTL);
+    map.insert(token.clone(), (operation, std::time::Instant::now()));
+    Ok(token)
+}
+
+/// 校验并消费一个 confirmation token：成功后立即移除（一次性），
+/// operation 不匹配或已超时均视为无效。
+fn consume_destructive_token(
+    handle: &AppHandle,
+    token: &str,
+    expected_operation: &str,
+) -> Result<(), String> {
+    let store = handle.state::<DestructiveTokenStore>();
+    let mut map = store.0.lock().map_err(|e| e.to_string())?;
+    match map.remove(token) {
+        Some((op, issued))
+            if op == expected_operation && issued.elapsed() < DESTRUCTIVE_TOKEN_TTL =>
+        {
+            Ok(())
+        }
+        Some(_) => Err("Invalid or expired confirmation token".to_string()),
+        None => Err("Confirmation token not found".to_string()),
+    }
+}
+
 #[derive(serde::Serialize)]
 pub struct BatchFileOperationResult {
     pub succeeded: usize,
@@ -2705,8 +2748,13 @@ pub async fn get_trash_diagnostics(
 }
 
 #[command]
-pub async fn empty_trash(handle: AppHandle) -> Result<i64, String> {
+pub async fn empty_trash(
+    handle: AppHandle,
+    confirmation_token: String,
+) -> Result<i64, String> {
     eprintln!("[empty_trash] Emptying trash folder...");
+
+    consume_destructive_token(&handle, &confirmation_token, "empty_trash")?;
 
     let library_root = library_root(&handle)?;
     let db = db_path(&handle)?;
@@ -3367,8 +3415,12 @@ pub async fn sync_library_from_disk(handle: AppHandle) -> Result<ScanResult, Str
 
 /// æ¸…ç©ºæ‰€æœ‰åª’ä½“æ•°æ®ï¼ˆç“¨äºŽé‡æ–°åˆå§‹åŒ–ï¼‰ï¼Œè¿“å›žåˆ é™¤çš„æ–‡ä»¶æ•°é‡
 #[command]
-pub async fn clear_all_media(handle: AppHandle) -> Result<i64, String> {
+pub async fn clear_all_media(
+    handle: AppHandle,
+    confirmation_token: String,
+) -> Result<i64, String> {
     eprintln!("[clear_all_media] Starting to clear all media...");
+    consume_destructive_token(&handle, &confirmation_token, "clear_all_media")?;
     let db = db_path(&handle)?;
     let count = tokio::task::spawn_blocking(move || {
         let mut conn = open_conn(&db).map_err(|e| e.to_string())?;
@@ -4222,8 +4274,14 @@ pub async fn import_paths_to_library(
     .map_err(|e| format!("Task join error: {}", e))?
 }
 #[command]
-pub async fn delete_file_permanently(handle: AppHandle, id: String) -> Result<(), String> {
+pub async fn delete_file_permanently(
+    handle: AppHandle,
+    id: String,
+    confirmation_token: String,
+) -> Result<(), String> {
     eprintln!("[delete_file_permanently] Deleting file: {}", id);
+
+    consume_destructive_token(&handle, &confirmation_token, "delete_file_permanently")?;
 
     let db = db_path(&handle)?;
     let library_root = library_root(&handle)?;
@@ -4280,6 +4338,7 @@ pub async fn delete_file_permanently(handle: AppHandle, id: String) -> Result<()
 pub async fn batch_delete_files_permanently(
     handle: AppHandle,
     ids: Vec<String>,
+    confirmation_token: String,
 ) -> Result<BatchFileOperationResult, String> {
     if ids.is_empty() {
         return Ok(BatchFileOperationResult {
@@ -4288,6 +4347,8 @@ pub async fn batch_delete_files_permanently(
             first_error: None,
         });
     }
+
+    consume_destructive_token(&handle, &confirmation_token, "batch_delete_files_permanently")?;
 
     let db = db_path(&handle)?;
     let library_root = library_root(&handle)?;

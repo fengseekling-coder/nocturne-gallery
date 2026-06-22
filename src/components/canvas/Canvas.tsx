@@ -1946,7 +1946,13 @@ export const Canvas: React.FC<CanvasProps> = () => {
           if (!confirmed) break;
 
           try {
-            const result = await invoke<BatchFileOperationResult>('batch_delete_files_permanently', { ids: idsToDelete });
+            const confirmationToken = await invoke<string>('request_destructive_token', {
+              operation: 'batch_delete_files_permanently',
+            });
+            const result = await invoke<BatchFileOperationResult>('batch_delete_files_permanently', {
+              ids: idsToDelete,
+              confirmationToken,
+            });
             if (result.succeeded > 0) {
               showToast(
                 result.failed > 0

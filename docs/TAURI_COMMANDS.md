@@ -15,7 +15,7 @@ npm run audit:commands
 - **退出码 0**：每个前端 invoke 均有对应 Rust 命令
 - **退出码 1**：列出后端缺失的命令名
 
-当前基线（随代码演进会变）：约 **62** 个前端 invoke、**87** 个已注册命令（多出的多为 Rust 内部或尚未从前端调用的 API）。
+当前基线（随代码演进会变）：约 **62** 个前端 invoke、**88** 个已注册命令（多出的多为 Rust 内部或尚未从前端调用的 API）。
 
 ## 开发注意
 
@@ -109,15 +109,16 @@ npm run audit:commands
 | `batch_restore_from_trash` | write, destructive | 否（按 ids） | ✓ |
 | `reconcile_trash_with_disk` | write | 否 | ✓ |
 | `get_trash_diagnostics` | read | 否 | — |
-| `empty_trash` | destructive | 否 | ✓ |
+| `empty_trash` | destructive | 否 | ✓（+ confirmation token 二次确认） |
 
 ### 永久删除与批量清理
 
 | 命令 | 风险标签 | path-input | 库根校验 |
 |------|----------|-----------|---------|
-| `delete_file_permanently` | destructive | 否（按 id） | ✓ |
-| `batch_delete_files_permanently` | destructive | 否（按 ids） | ✓ |
-| `clear_all_media` | destructive | 否 | — |
+| `request_destructive_token` | write, network:no | 否（按 operation 签发一次性 token） | — |
+| `delete_file_permanently` | destructive | 否（按 id） | ✓（+ confirmation token 二次确认） |
+| `batch_delete_files_permanently` | destructive | 否（按 ids） | ✓（+ confirmation token 二次确认） |
+| `clear_all_media` | destructive | 否 | —（confirmation token 二次确认） |
 | `emergency_cleanup_invalid_files` | destructive | 否 | — |
 
 ### 文件管理（库内）
@@ -197,7 +198,7 @@ npm run audit:commands
 
 1. **统一校验入口（已落地）**：落盘类命令统一复用 `resolve_under_library_root(input, library_root) -> Result<PathBuf>`，对输入与库根分别 `canonicalize`（解析符号链接、消除 `..`、借助规范化处理 macOS 大小写不敏感与 Unicode 归一化差异），再用 canonical 结果做 `starts_with` 边界判定；目标尚不存在时规范化最近的已存在祖先目录再拼接剩余段，并拒绝剩余段中的穿越组件。外部来源/外部引用类命令复用 `validate_existing_local_path`（存在性 + 规范化，不强制库内）；库根定义类命令走 `ensure_switchable_library_root`。
 2. **路径校验接入（已完成）**：上述命令按语义分三类接入——A 类（落盘目标须在库根内）：`scan_directory`、`import_file_to_library`、`import_paths_to_library`、`import_generated_image_to_ai_prompts`、`save_clipboard_image`、`replace_file`（目标）、`start_file_drag`；B 类（外部来源/引用，仅存在性 + 规范化，允许库外）：`replace_file`（source）、`add_media_attachments`、`extract_colors`、`get_file_info`、`get_attachment_preview_data`、`check_duplicate`、`save_file_as`（source）；C 类（定义库根本身）：`set_library_root`、`init_library`。
-3. **破坏性命令服务端二次确认**：`delete_file_permanently`、`batch_delete_files_permanently`、`empty_trash`、`clear_all_media`、`emergency_cleanup_invalid_files` 不应只信任前端 Modal，后端校验目标范围（库内 / 受控回收站）与 confirmation token。
+3. **破坏性命令服务端二次确认**：`delete_file_permanently`、`batch_delete_files_permanently`、`empty_trash`、`clear_all_media`（已落地 token 门禁）不再只信任前端 Modal——前端须先 `invoke('request_destructive_token', { operation })` 取得一次性 token（默认 30s TTL，operation 必须匹配且用后即焚），再作为 `confirmationToken` 传入对应命令，后端经 `consume_destructive_token` 校验后才执行；目标范围（库内 / 受控回收站）仍由各自路径校验保证。`emergency_cleanup_invalid_files` 待接入同一机制。
 4. **出网最小化**：`network` 命令仅限用户显式配置 provider 后调用；endpoint 白名单与 key 处理集中在后端，日志脱敏。
 
 > 维护提示：本表按 `src-tauri/src/lib.rs` 的 `generate_handler!` 注册顺序与领域归并整理；新增/删除命令时同步更新对应分组与“库根校验”状态。
