@@ -9,7 +9,8 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tauri::AppHandle;
 
-use super::db_path;
+use crate::commands::db_path;
+use crate::commands::validate_http_url;
 use crate::db::{crud, open_conn};
 use crate::models::{ItemDetail, ItemSummary, LibraryStats, ReversePromptData};
 
@@ -164,20 +165,6 @@ fn is_gemini_model(model: &str) -> bool {
 fn is_openai_compatible_image_model(model: &str) -> bool {
     let normalized = model.trim().to_lowercase();
     normalized.contains("image") || normalized.starts_with("dall-e")
-}
-
-fn validate_http_url(url: &str) -> Result<String, String> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
-        return Err("URL 无效".to_string());
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        Ok(trimmed.to_string())
-    } else {
-        Err("仅支持保存 http:// 或 https:// 链接".to_string())
-    }
 }
 
 fn normalize_path_for_boundary_check(path: &str) -> Option<std::path::PathBuf> {
@@ -1160,3 +1147,297 @@ pub async fn openai_generate_image(
             .map(str::to_string),
     })
 }
+
+// ---------------------------------------------------------------------------
+// Claude — 后端代理 (P0-3: 消除浏览器直接出网)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-5";
+
+/// 从偏好设置 / 环境变量读取 Claude API key。
+fn resolve_claude_config(handle: &AppHandle) -> Result<(String, String), String> {
+    let api_key = non_empty_trimmed(std::env::var("CLAUDE_API_KEY").ok())
+        .or_else(|| non_empty_trimmed(read_pref(handle, "claude_api_key")))
+        .ok_or("Claude 接口密钥未配置，请在设置中填入 claude_api_key，或设置 CLAUDE_API_KEY 环境变量")?;
+
+    let model = non_empty_trimmed(std::env::var("CLAUDE_MODEL").ok())
+        .or_else(|| non_empty_trimmed(read_pref(handle, "claude_model")))
+        .unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.to_string());
+
+    Ok((api_key, model))
+}
+
+#[tauri::command]
+pub async fn claude_chat_completion(
+    handle: AppHandle,
+    messages: Vec<Value>,
+    tools: Vec<OpenAiToolSpec>,
+    model: Option<String>,
+) -> Result<OpenAiChatResult, String> {
+    let (api_key, resolved_model) = resolve_claude_config(&handle)?;
+    let model = model
+        .filter(|m| !m.is_empty())
+        .unwrap_or(resolved_model);
+
+    log::info!(
+        "[claude_chat_completion] model={} messages={} tools={}",
+        model,
+        messages.len(),
+        tools.len()
+    );
+
+    let max_tokens = 8192_u32;
+
+    let mut payload = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    });
+
+    if !tools.is_empty() {
+        payload["tools"] = Value::Array(
+            tools
+                .into_iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    let response = reqwest::Client::new()
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-dangerous-direct-browser-access", "false")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|_| "无法连接 Claude API，请检查网络".to_string())?;
+
+    let status = response.status();
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("Claude 响应解析失败: {}", e))?;
+
+    if !status.is_success() {
+        let msg = body
+            .get("error")
+            .and_then(Value::as_object)
+            .and_then(|o| o.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("Claude API 请求失败");
+        return Err(format!("Claude API {}: {}", status.as_u16(), msg));
+    }
+
+    let content = body
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.iter().find(|b| b.get("type") == Some(&Value::String("text".to_string()))))
+        .and_then(|b| b.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let tool_calls: Vec<OpenAiToolCallResult> = body
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|b| b.get("type") == Some(&Value::String("tool_use".to_string())))
+                .filter_map(|b| {
+                    let name = b.get("name").and_then(Value::as_str)?.to_string();
+                    let id = b.get("id").and_then(Value::as_str)?.to_string();
+                    let input = b.get("input").cloned().unwrap_or(serde_json::json!({}));
+                    Some(OpenAiToolCallResult { id, name, arguments: input })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(OpenAiChatResult { content, tool_calls })
+}
+
+// ---------------------------------------------------------------------------
+// 百炼 (Bailian) — 后端代理 (P0-3: 消除浏览器直接出网)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_BAILIAN_MODEL: &str = "qwen-plus";
+const BAILIAN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+
+/// 从偏好设置 / 环境变量读取百炼 API key。
+fn resolve_bailian_config(handle: &AppHandle) -> Result<(String, String), String> {
+    let api_key = non_empty_trimmed(std::env::var("BAILIAN_API_KEY").ok())
+        .or_else(|| non_empty_trimmed(read_pref(handle, "bailian_api_key")))
+        .ok_or("百炼接口密钥未配置，请在设置中填入 bailian_api_key，或设置 BAILIAN_API_KEY 环境变量")?;
+
+    let model = non_empty_trimmed(std::env::var("BAILIAN_MODEL").ok())
+        .or_else(|| non_empty_trimmed(read_pref(handle, "bailian_model")))
+        .unwrap_or_else(|| DEFAULT_BAILIAN_MODEL.to_string());
+
+    Ok((api_key, model))
+}
+
+#[tauri::command]
+pub async fn bailian_chat_completion(
+    handle: AppHandle,
+    messages: Vec<Value>,
+    tools: Vec<OpenAiToolSpec>,
+    model: Option<String>,
+) -> Result<OpenAiChatResult, String> {
+    let (api_key, resolved_model) = resolve_bailian_config(&handle)?;
+    let model = model
+        .filter(|m| !m.is_empty())
+        .unwrap_or(resolved_model);
+
+    log::info!(
+        "[bailian_chat_completion] model={} messages={} tools={}",
+        model,
+        messages.len(),
+        tools.len()
+    );
+
+    let mut payload = serde_json::json!({
+        "model": model,
+        "messages": messages,
+    });
+
+    if !tools.is_empty() {
+        payload["tools"] = Value::Array(
+            tools
+                .into_iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/chat/completions", BAILIAN_BASE_URL))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|_| "无法连接百炼 API，请检查网络".to_string())?;
+
+    let status = response.status();
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("百炼响应解析失败: {}", e))?;
+
+    if !status.is_success() {
+        let msg = body
+            .get("error")
+            .and_then(Value::as_object)
+            .and_then(|o| o.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("百炼 API 请求失败");
+        return Err(format!("百炼 API {}: {}", status.as_u16(), msg));
+    }
+
+    let message = body
+        .pointer("/choices/0/message")
+        .ok_or_else(|| "百炼响应缺少 message 字段".to_string())?;
+
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let tool_calls: Vec<OpenAiToolCallResult> = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|call| {
+                    let function = call.get("function")?;
+                    let name = function.get("name").and_then(Value::as_str)?.to_string();
+                    let id = call.get("id").and_then(Value::as_str)?.to_string();
+                    let arguments = function
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    Some(OpenAiToolCallResult { id, name, arguments })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(OpenAiChatResult { content, tool_calls })
+}
+
+// ---------------------------------------------------------------------------
+// Tavily 网络搜索 — 后端代理 (P0-4: 消除浏览器直接出网 key)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn tavily_search(
+    handle: AppHandle,
+    query: String,
+    search_depth: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let api_key = non_empty_trimmed(std::env::var("TAVILY_API_KEY").ok())
+        .or_else(|| non_empty_trimmed(read_pref(&handle, "tavily_api_key")))
+        .ok_or("Tavily 接口密钥未配置，请在设置中填入 tavily_api_key，或设置 TAVILY_API_KEY 环境变量")?;
+
+    let resolved_depth = search_depth.clone().unwrap_or_else(|| "basic".to_string());
+    log::info!(
+        "[tavily_search] query=\"{}\" depth={}",
+        query,
+        resolved_depth
+    );
+
+    let payload = serde_json::json!({
+        "api_key": api_key,
+        "query": query,
+        "search_depth": resolved_depth,
+        "max_results": 5,
+        "include_answer": true,
+    });
+
+    let response = reqwest::Client::new()
+        .post("https://api.tavily.com/search")
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|_| "无法连接 Tavily 搜索服务，请检查网络".to_string())?;
+
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Tavily 响应解析失败: {}", e))?;
+
+    if !status.is_success() {
+        let msg = body
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("Tavily API 请求失败");
+        return Err(format!("Tavily API {}: {}", status.as_u16(), msg));
+    }
+
+    Ok(body)
+}
+

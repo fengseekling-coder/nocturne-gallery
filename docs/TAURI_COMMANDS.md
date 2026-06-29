@@ -15,13 +15,13 @@ npm run audit:commands
 - **退出码 0**：每个前端 invoke 均有对应 Rust 命令
 - **退出码 1**：列出后端缺失的命令名
 
-当前基线（随代码演进会变）：约 **62** 个前端 invoke、**88** 个已注册命令（多出的多为 Rust 内部或尚未从前端调用的 API）。
+当前基线（随代码演进会变）：约 **67** 个前端 invoke、**91** 个已注册命令（多出的多为 Rust 内部或尚未从前端调用的 API）。
 
 ## 开发注意
 
 - 新增 `invoke` 时必须在 `lib.rs` 的 `generate_handler!` 中注册同名函数（或 `commands::…::fn` 映射）。
 - AI 相关命令在 `src-tauri/src/commands/ai_tools.rs`，以 `commands::ai_tools::…` 形式注册。
-- 新增任何接收路径或执行文件读写/删除的命令，必须在表中登记风险级别，并复用统一的库根路径校验（见“路径安全约定”）。
+- 新增任何接收路径或执行文件读写/删除的命令，必须在表中登记风险级别，并复用统一的库根路径校验（见"路径安全约定"）。
 
 ---
 
@@ -37,7 +37,7 @@ npm run audit:commands
 - **AI**：AI Agent 工具命令（`commands::ai_tools::…`）
 - **path-input**：命令签名直接接收前端传入的路径/URL 字符串
 
-“库根校验”列：`✓` 表示已在实现中调用 `resolve_under_library_root` / `validate_path_in_library` / `validate_existing_local_path` / `validate_http_url` 等校验；`—` 表示无路径入参。当前所有接收外部路径的命令均已接入校验；后续新增此类命令时，须同步登记其校验方式并更新本列状态。
+"库根校验"列：`✓` 表示已在实现中调用 `resolve_under_library_root` / `validate_path_in_library` / `validate_existing_local_path` / `validate_http_url` 等校验；`—` 表示无路径入参。当前所有接收外部路径的命令均已接入校验；后续新增此类命令时，须同步登记其校验方式并更新本列状态。
 
 ### 媒体扫描与查询
 
@@ -191,6 +191,9 @@ npm run audit:commands
 | `openai_list_models` | network, AI | 否 | — |
 | `openai_chat_completion` | network, AI | 否 | — |
 | `openai_generate_image` | network, AI, write | 否（生成图落盘） | — |
+| `claude_chat_completion` | network, AI | 否（key 走后端，读偏好设置） | — |
+| `bailian_chat_completion` | network, AI | 否（key 走后端，读偏好设置） | — |
+| `tavily_search` | network, AI | 否（key 走后端，读偏好设置） | — |
 
 ---
 
@@ -199,6 +202,11 @@ npm run audit:commands
 1. **统一校验入口（已落地）**：落盘类命令统一复用 `resolve_under_library_root(input, library_root) -> Result<PathBuf>`，对输入与库根分别 `canonicalize`（解析符号链接、消除 `..`、借助规范化处理 macOS 大小写不敏感与 Unicode 归一化差异），再用 canonical 结果做 `starts_with` 边界判定；目标尚不存在时规范化最近的已存在祖先目录再拼接剩余段，并拒绝剩余段中的穿越组件。外部来源/外部引用类命令复用 `validate_existing_local_path`（存在性 + 规范化，不强制库内）；库根定义类命令走 `ensure_switchable_library_root`。
 2. **路径校验接入（已完成）**：上述命令按语义分三类接入——A 类（落盘目标须在库根内）：`scan_directory`、`import_file_to_library`、`import_paths_to_library`、`import_generated_image_to_ai_prompts`、`save_clipboard_image`、`replace_file`（目标）、`start_file_drag`；B 类（外部来源/引用，仅存在性 + 规范化，允许库外）：`replace_file`（source）、`add_media_attachments`、`extract_colors`、`get_file_info`、`get_attachment_preview_data`、`check_duplicate`、`save_file_as`（source）；C 类（定义库根本身）：`set_library_root`、`init_library`。
 3. **破坏性命令服务端二次确认**：`delete_file_permanently`、`batch_delete_files_permanently`、`empty_trash`、`clear_all_media`（已落地 token 门禁）不再只信任前端 Modal——前端须先 `invoke('request_destructive_token', { operation })` 取得一次性 token（默认 30s TTL，operation 必须匹配且用后即焚），再作为 `confirmationToken` 传入对应命令，后端经 `consume_destructive_token` 校验后才执行；目标范围（库内 / 受控回收站）仍由各自路径校验保证。`emergency_cleanup_invalid_files` 待接入同一机制。
-4. **出网最小化**：`network` 命令仅限用户显式配置 provider 后调用；endpoint 白名单与 key 处理集中在后端，日志脱敏。
 
-> 维护提示：本表按 `src-tauri/src/lib.rs` 的 `generate_handler!` 注册顺序与领域归并整理；新增/删除命令时同步更新对应分组与“库根校验”状态。
+   - **消费语义**：token 无论成功/失败均被移除（一次性），前端若需要重试必须重新请求新 token。
+   - **错误分类**：校验失败时后端返回三类明确错误——`Confirmation token not found`（token 不存在或已被使用）、`Confirmation token expired`（超过 30s TTL）、`Confirmation token operation mismatch`（operation 与签发时不符）。前端可据此区分 UI 提示。
+   - **测试覆盖**：`src-tauri/src/commands/mod.rs` 中的 `#[cfg(test)] mod destructive_token_tests` 已覆盖颁发唯一性、TTL 过期、operation 不匹配、一次性消费、未知 token、空 token、错误消息可区分性等场景，10 个用例全通过。
+4. **出网最小化**：`network` 命令仅限用户显式配置 provider 后调用；endpoint 白名单与 key 处理集中在后端，日志脱敏。
+5. **CSP 收紧（已落地 P0-3）**：`connect-src` 已移除 `http://127.0.0.1:*` / `http://localhost:*` 通配、`https://api.anthropic.com`、`https://dashscope.aliyuncs.com`（AI key 不再从浏览器明文发出）；保留 `https://api.tavily.com`（Tavily 暂无后端代理）。Claude / Bailian API key 现从后端读取偏好设置，新增 `claude_chat_completion` / `bailian_chat_completion` 后端命令；`style-src 'unsafe-inline'` 保留（Tailwind）。
+
+> 维护提示：本表按 `src-tauri/src/lib.rs` 的 `generate_handler!` 注册顺序与领域归并整理；新增/删除命令时同步更新对应分组与"库根校验"状态。

@@ -41,33 +41,18 @@ export const webTools: Tool[] = [
     },
     execute: async (args): Promise<WebSearchResult> => {
       const { invoke } = await import('@tauri-apps/api/core');
-      const apiKey = await invoke<string | null>('get_preference', { key: 'tavily_api_key' });
+      const result = await invoke<{ answer?: string; results?: TavilySearchResult[]; detail?: string }>('tavily_search', {
+        query: args.query,
+        searchDepth: args.search_depth || 'basic',
+      }).catch((err: Error) => ({ detail: err.message }));
 
-      if (!apiKey) {
-        return { error: '未配置 Tavily 接口密钥，请在设置中添加' };
+      if (result && 'detail' in result) {
+        return { error: `Tavily 搜索失败: ${result.detail}` };
       }
 
-      const response = await fetch('https://api.tavily.com/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          api_key: apiKey,
-          query: args.query,
-          search_depth: args.search_depth || 'basic',
-          max_results: 5,
-          include_answer: true,
-        })
-      });
-
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({})) as { detail?: string };
-        return { error: `Tavily API Error: ${err.detail || response.statusText}` };
-      }
-
-      const data = (await response.json()) as TavilySearchResponse;
       return {
-        answer: data.answer,
-        results: data.results?.map((r) => ({
+        answer: result?.answer,
+        results: result?.results?.map((r) => ({
           title: r.title,
           url: r.url,
           snippet: r.content?.slice(0, 300),
